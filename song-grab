@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""
+song-grab: Extract songs from Instagram Reels and TikTok videos.
+
+Usage: song-grab "https://instagram.com/reel/..." or "https://tiktok.com/..."
+
+Downloads the audio, identifies the song via Shazam, finds it on YouTube,
+and saves the MP3 to your music folder.
+"""
+
+import asyncio
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# Load output directory from config file
+CONFIG_FILE = Path.home() / ".config" / "song-grab" / "config"
+
+def get_output_dir() -> Path:
+    """Get the output directory from config file."""
+    if CONFIG_FILE.exists():
+        output_dir = CONFIG_FILE.read_text().strip()
+        if output_dir:
+            return Path(output_dir)
+    # Default fallback
+    return Path.home() / "Music" / "SongGrab"
+
+OUTPUT_DIR = get_output_dir()
+
+
+def sanitize_filename(name: str) -> str:
+    """Remove characters that are invalid in filenames."""
+    name = re.sub(r'[<>:"/\\|?*]', '', name)
+    name = re.sub(r'\s+', ' ', name)
+    return name.strip()
+
+
+def format_timestamp(seconds: float) -> str:
+    """Convert seconds to M.SS format (e.g., 82.5 -> '1.22')"""
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{minutes}.{secs:02d}"
+
+
+def check_dependencies():
+    """Verify required tools are available."""
+    try:
+        subprocess.run(["yt-dlp", "--version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: yt-dlp is not installed. Install with: brew install yt-dlp")
+        sys.exit(1)
+
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: ffmpeg is not installed. Install with: brew install ffmpeg")
+        sys.exit(1)
+
+
+def check_output_directory():
+    """Ensure the output directory exists."""
+    if not OUTPUT_DIR.exists():
+        print(f"Creating output directory: {OUTPUT_DIR}")
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def download_source_audio(url: str, output_path: Path) -> bool:
+    """Download audio from Instagram/TikTok using yt-dlp."""
+    print(f"Downloading audio from source...")
+
+    cmd = [
+        "yt-dlp",
+        "--cookies-from-browser", "safari",
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "-o", str(output_path),
+        "--no-playlist",
+        "--quiet",
+        "--progress",
+        url
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"Error downloading: {result.stderr}")
+        return False
+
+    return output_path.exists()
+
+
+async def identify_with_shazam(audio_path: Path) -> dict | None:
+    """Use ShazamIO to identify the song in the audio file."""
+    from shazamio import Shazam
+
+    shazam = Shazam()
+
+    try:
+        result = await shazam.recognize(str(audio_path))
+
+        if result and "track" in result:
+            track = result["track"]
+            offset = None
+            if result.get("matches") and len(result["matches"]) > 0:
+                offset = result["matches"][0].get("offset")
+            return {
+                "title": track.get("title", "Unknown"),
+                "artist": track.get("subtitle", "Unknown Artist"),
+                "full_title": track.get("share", {}).get("subject", ""),
+                "offset": offset,
+            }
+    except Exception as e:
+        print(f"Shazam error: {e}")
+
+    return None
+
+
+def identify_with_audd(audio_path: Path) -> dict | None:
+    """Use AudD as a fallback for song identification."""
+    import base64
+    import json
+    import urllib.request
+    import urllib.error
+
+    try:
+        with open(audio_path, "rb") as f:
+            audio_data = base64.b64encode(f.read()).decode("utf-8")
+
+        data = {
+            "audio": audio_data,
+            "return": "spotify",
+        }
+
+        req = urllib.request.Request(
+            "https://api.audd.io/",
+            data=urllib.parse.urlencode(data).encode(),
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        if result.get("status") == "success" and result.get("result"):
+            track = result["result"]
+            offset = None
+            timecode = track.get("timecode")
+            if timecode:
+                try:
+                    parts = timecode.split(":")
+                    if len(parts) == 2:
+                        offset = int(parts[0]) * 60 + int(parts[1])
+                except (ValueError, AttributeError):
+                    pass
+            return {
+                "title": track.get("title", "Unknown"),
+                "artist": track.get("artist", "Unknown Artist"),
+                "full_title": f"{track.get('artist', '')} - {track.get('title', '')}",
+                "offset": offset,
+            }
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            print("AudD rate limit reached (free tier: ~300/month)")
+        else:
+            print(f"AudD HTTP error: {e}")
+    except Exception as e:
+        print(f"AudD error: {e}")
+
+    return None
+
+
+async def identify_song(audio_path: Path, duration_seconds: int = 10) -> dict | None:
+    """Identify song using Shazam, with AudD as fallback."""
+    import urllib.parse
+
+    print("Identifying song with Shazam...")
+    result = await identify_with_shazam(audio_path)
+
+    if result:
+        return result
+
+    print("Shazam couldn't identify. Trying AudD as fallback...")
+    return identify_with_audd(audio_path)
+
+
+def search_youtube(artist: str, title: str) -> str | None:
+    """Search YouTube for the song and return the best match URL."""
+    print(f"Searching YouTube for: {artist} - {title}...")
+
+    search_queries = [
+        f"{artist} {title} official audio",
+        f"{artist} {title} audio",
+        f"{artist} {title}",
+        f"{title} {artist}",
+    ]
+
+    for query in search_queries:
+        cmd = [
+            "yt-dlp",
+            "--default-search", "ytsearch1",
+            "--get-url",
+            "--get-id",
+            "-f", "bestaudio",
+            "--no-playlist",
+            "--quiet",
+            query
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.strip().split('\n')
+            for line in lines:
+                if len(line) == 11:
+                    return f"https://www.youtube.com/watch?v={line}"
+            return lines[0]
+
+    return None
+
+
+def download_youtube_mp3(youtube_url: str, output_path: Path) -> bool:
+    """Download the YouTube video as MP3."""
+    print(f"Downloading MP3...")
+
+    cmd = [
+        "yt-dlp",
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "-o", str(output_path),
+        "--no-playlist",
+        "--quiet",
+        "--progress",
+        youtube_url
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"Error downloading from YouTube: {result.stderr}")
+        return False
+
+    return output_path.exists()
+
+
+async def main():
+    if len(sys.argv) < 2:
+        print("Usage: song-grab <instagram-reel-or-tiktok-url>")
+        print("Example: song-grab 'https://www.instagram.com/reel/ABC123/'")
+        print(f"\nSongs are saved to: {OUTPUT_DIR}")
+        sys.exit(1)
+
+    url = sys.argv[1]
+
+    if not any(domain in url.lower() for domain in ["instagram.com", "tiktok.com"]):
+        print("Warning: URL doesn't appear to be from Instagram or TikTok.")
+        print("Proceeding anyway...")
+
+    check_dependencies()
+    check_output_directory()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        source_audio = temp_path / "source.mp3"
+
+        if not download_source_audio(url, source_audio):
+            print("Failed to download audio from source.")
+            sys.exit(1)
+
+        song_info = await identify_song(source_audio)
+
+        if not song_info:
+            print("\nCould not identify the song.")
+            print("Try Shazam on your phone, or the song might be too obscure.")
+            sys.exit(1)
+
+        artist = song_info["artist"]
+        title = song_info["title"]
+        print(f"\nIdentified: {artist} - {title}")
+
+        if song_info.get("offset") is not None:
+            timestamp = format_timestamp(song_info["offset"])
+            filename = sanitize_filename(f"{title} {timestamp}.mp3")
+        else:
+            filename = sanitize_filename(f"{title}.mp3")
+        output_path = OUTPUT_DIR / filename
+
+        if output_path.exists():
+            print(f"\nSong already exists: {output_path}")
+            sys.exit(0)
+
+        youtube_url = search_youtube(artist, title)
+
+        if not youtube_url:
+            print(f"\nCould not find '{artist} - {title}' on YouTube.")
+            print("Try searching manually.")
+            sys.exit(1)
+
+        print(f"Found on YouTube: {youtube_url}")
+
+        if not download_youtube_mp3(youtube_url, output_path):
+            print("Failed to download from YouTube.")
+            sys.exit(1)
+
+        print(f"\nSaved: {output_path}")
+        print("Done!")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
