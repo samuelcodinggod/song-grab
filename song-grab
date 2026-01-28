@@ -67,6 +67,59 @@ def check_output_directory():
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def extract_tiktok_music_metadata(url: str) -> dict | None:
+    """Extract song metadata directly from TikTok page (more accurate than Shazam)."""
+    import json
+    import urllib.request
+
+    if "tiktok.com" not in url.lower():
+        return None
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            html = response.read().decode("utf-8")
+
+        # Find the music metadata in the page
+        match = re.search(r'"music":\{([^}]+)\}', html)
+        if not match:
+            return None
+
+        # Parse the JSON-like content
+        music_json = "{" + match.group(1) + "}"
+        # Handle escaped unicode
+        music_json = music_json.encode().decode("unicode_escape")
+
+        # Extract title and author using regex (more reliable than JSON parsing here)
+        title_match = re.search(r'"title":"([^"]+)"', music_json)
+        author_match = re.search(r'"authorName":"([^"]+)"', music_json)
+
+        if title_match:
+            title = title_match.group(1)
+            artist = author_match.group(1) if author_match else "Unknown Artist"
+
+            # Skip generic/original sound entries
+            if "original sound" in title.lower() or title.startswith("som original"):
+                return None
+
+            return {
+                "title": title,
+                "artist": artist,
+                "full_title": f"{artist} - {title}",
+                "offset": None,
+                "source": "tiktok_metadata"
+            }
+    except Exception as e:
+        print(f"Could not extract TikTok metadata: {e}")
+
+    return None
+
+
 def download_tiktok_slideshow_audio(url: str, output_path: Path) -> bool:
     """Download audio from a TikTok slideshow by extracting the audio URL from the page."""
     import urllib.request
@@ -330,11 +383,22 @@ async def main():
         temp_path = Path(temp_dir)
         source_audio = temp_path / "source.mp3"
 
+        # Step 1: Try to get song info from TikTok metadata (most accurate)
+        song_info = None
+        if "tiktok.com" in url.lower():
+            print("Checking TikTok for song metadata...")
+            song_info = extract_tiktok_music_metadata(url)
+            if song_info:
+                print(f"Found song in TikTok metadata: {song_info['artist']} - {song_info['title']}")
+
+        # Step 2: Download audio from source
         if not download_source_audio(url, source_audio):
             print("Failed to download audio from source.")
             sys.exit(1)
 
-        song_info = await identify_song(source_audio)
+        # Step 3: If no TikTok metadata, identify song with Shazam/AudD
+        if not song_info:
+            song_info = await identify_song(source_audio)
 
         if not song_info:
             print("\nCould not identify the song.")
@@ -343,7 +407,8 @@ async def main():
 
         artist = song_info["artist"]
         title = song_info["title"]
-        print(f"\nIdentified: {artist} - {title}")
+        if song_info.get("source") != "tiktok_metadata":
+            print(f"\nIdentified: {artist} - {title}")
 
         if song_info.get("offset") is not None:
             timestamp = format_timestamp(song_info["offset"])
