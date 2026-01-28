@@ -424,13 +424,131 @@ def update_script():
         sys.exit(1)
 
 
+async def raw_download(url: str):
+    """Download raw audio from TikTok without any song identification."""
+    import urllib.request
+    from datetime import datetime
+
+    check_dependencies()
+    check_output_directory()
+
+    print("Downloading raw audio...")
+
+    # Try to get TikTok metadata for the audio URL and title
+    audio_url = None
+    suggested_name = None
+
+    if "tiktok.com" in url.lower():
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                html = response.read().decode("utf-8")
+
+            # Try to find playUrl
+            match = re.search(r'"playUrl":"([^"]+)"', html)
+            if match:
+                audio_url = match.group(1).encode().decode("unicode_escape")
+
+            # Try to get a title for the filename
+            title_match = re.search(r'"music":\{[^}]*"title":"([^"]+)"', html)
+            if title_match:
+                suggested_name = title_match.group(1)
+
+        except Exception as e:
+            print(f"Could not extract TikTok data: {e}")
+
+    if audio_url:
+        # Download directly from TikTok
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if suggested_name:
+            filename = sanitize_filename(f"{suggested_name}.mp3")
+        else:
+            filename = f"tiktok_audio_{timestamp}.mp3"
+
+        output_path = OUTPUT_DIR / filename
+
+        try:
+            req = urllib.request.Request(
+                audio_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+                    "Referer": "https://www.tiktok.com/"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=60) as response:
+                audio_data = response.read()
+
+            # Save and convert to mp3
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_audio = Path(temp_dir) / "temp_audio"
+                with open(temp_audio, "wb") as f:
+                    f.write(audio_data)
+
+                cmd = ["ffmpeg", "-y", "-i", str(temp_audio), "-q:a", "0", str(output_path)]
+                subprocess.run(cmd, capture_output=True, check=True)
+
+            print(f"\nSaved: {output_path}")
+            print("Done!")
+            sys.exit(0)
+
+        except Exception as e:
+            print(f"Direct download failed: {e}")
+            print("Trying yt-dlp fallback...")
+
+    # Fallback to yt-dlp
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        source_audio = temp_path / "source.mp3"
+
+        cmd = [
+            "yt-dlp",
+            "--cookies-from-browser", "safari",
+            "-x",
+            "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "-o", str(source_audio),
+            "--no-playlist",
+            "--quiet",
+            "--progress",
+            url
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(f"Error downloading: {result.stderr}")
+            sys.exit(1)
+
+        # Save with timestamp name
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"tiktok_audio_{timestamp}.mp3"
+        output_path = OUTPUT_DIR / filename
+
+        import shutil
+        shutil.copy(source_audio, output_path)
+
+        print(f"\nSaved: {output_path}")
+        print("Done!")
+        sys.exit(0)
+
+
 async def main():
     # Handle --update flag
     if len(sys.argv) >= 2 and sys.argv[1] in ("--update", "-u", "update"):
         update_script()
 
+    # Handle --raw flag
+    if len(sys.argv) >= 3 and sys.argv[1] in ("--raw", "-r", "raw"):
+        await raw_download(sys.argv[2])
+
     if len(sys.argv) < 2:
         print("Usage: song-grab <instagram-reel-or-tiktok-url>")
+        print("       song-grab --raw <url>  (download raw audio, no identification)")
         print("       song-grab --update  (update to latest version)")
         print("Example: song-grab 'https://www.instagram.com/reel/ABC123/'")
         print(f"\nSongs are saved to: {OUTPUT_DIR}")
