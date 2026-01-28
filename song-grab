@@ -123,15 +123,62 @@ def extract_tiktok_music_metadata(url: str) -> dict | None:
 
 
 def extract_instagram_music_metadata(url: str) -> dict | None:
-    """Extract song metadata from Instagram reel embed page."""
-    import urllib.request
-
+    """Extract song metadata from Instagram reel using instaloader."""
     if "instagram.com" not in url.lower():
         return None
 
     try:
+        import instaloader
+    except ImportError:
+        print("instaloader not installed, trying embed fallback...")
+        return _extract_instagram_music_from_embed(url)
+
+    try:
         # Extract shortcode from URL
-        # Formats: /p/CODE/, /reel/CODE/, /reels/CODE/
+        shortcode_match = re.search(r'/(p|reel|reels)/([A-Za-z0-9_-]+)', url)
+        if not shortcode_match:
+            return None
+
+        shortcode = shortcode_match.group(2)
+
+        L = instaloader.Instaloader()
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+
+        # Check for music attribution info in the raw node data
+        if hasattr(post, '_node') and 'clips_music_attribution_info' in post._node:
+            music_info = post._node['clips_music_attribution_info']
+
+            # Skip if it uses original audio
+            if music_info.get('uses_original_audio', True):
+                return None
+
+            artist = music_info.get('artist_name', '')
+            title = music_info.get('song_name', '')
+
+            if not artist or not title:
+                return None
+
+            return {
+                "title": title,
+                "artist": artist,
+                "full_title": f"{artist} - {title}",
+                "offset": None,
+                "source": "instagram_metadata",
+                "audio_id": music_info.get('audio_id'),
+            }
+    except Exception as e:
+        print(f"Could not extract Instagram metadata via instaloader: {e}")
+        # Fall back to embed page method
+        return _extract_instagram_music_from_embed(url)
+
+    return None
+
+
+def _extract_instagram_music_from_embed(url: str) -> dict | None:
+    """Fallback: Extract song metadata from Instagram reel embed page."""
+    import urllib.request
+
+    try:
         shortcode_match = re.search(r'/(p|reel|reels)/([A-Za-z0-9_-]+)', url)
         if not shortcode_match:
             return None
@@ -149,18 +196,15 @@ def extract_instagram_music_metadata(url: str) -> dict | None:
             html = response.read().decode("utf-8")
 
         # Look for music info in HeaderSecondaryContent
-        # Format: <span>Artist(s) · Song Title</span>
         match = re.search(r'HeaderSecondaryContent[^>]*><span>([^<]+)</span>', html)
         if not match:
             return None
 
         music_text = match.group(1).strip()
 
-        # Skip if it's not music (e.g., location info or other metadata)
         if ' · ' not in music_text:
             return None
 
-        # Parse "Artist(s) · Song Title" format
         parts = music_text.split(' · ', 1)
         if len(parts) != 2:
             return None
@@ -168,7 +212,6 @@ def extract_instagram_music_metadata(url: str) -> dict | None:
         artist = parts[0].strip()
         title = parts[1].strip()
 
-        # Skip generic/original sound entries
         if "original sound" in title.lower() or "original audio" in title.lower():
             return None
 
@@ -180,7 +223,7 @@ def extract_instagram_music_metadata(url: str) -> dict | None:
             "source": "instagram_metadata",
         }
     except Exception as e:
-        print(f"Could not extract Instagram metadata: {e}")
+        print(f"Could not extract Instagram metadata from embed: {e}")
 
     return None
 
