@@ -122,6 +122,69 @@ def extract_tiktok_music_metadata(url: str) -> dict | None:
     return None
 
 
+def extract_instagram_music_metadata(url: str) -> dict | None:
+    """Extract song metadata from Instagram reel embed page."""
+    import urllib.request
+
+    if "instagram.com" not in url.lower():
+        return None
+
+    try:
+        # Extract shortcode from URL
+        # Formats: /p/CODE/, /reel/CODE/, /reels/CODE/
+        shortcode_match = re.search(r'/(p|reel|reels)/([A-Za-z0-9_-]+)', url)
+        if not shortcode_match:
+            return None
+
+        shortcode = shortcode_match.group(2)
+        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+
+        req = urllib.request.Request(
+            embed_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            html = response.read().decode("utf-8")
+
+        # Look for music info in HeaderSecondaryContent
+        # Format: <span>Artist(s) · Song Title</span>
+        match = re.search(r'HeaderSecondaryContent[^>]*><span>([^<]+)</span>', html)
+        if not match:
+            return None
+
+        music_text = match.group(1).strip()
+
+        # Skip if it's not music (e.g., location info or other metadata)
+        if ' · ' not in music_text:
+            return None
+
+        # Parse "Artist(s) · Song Title" format
+        parts = music_text.split(' · ', 1)
+        if len(parts) != 2:
+            return None
+
+        artist = parts[0].strip()
+        title = parts[1].strip()
+
+        # Skip generic/original sound entries
+        if "original sound" in title.lower() or "original audio" in title.lower():
+            return None
+
+        return {
+            "title": title,
+            "artist": artist,
+            "full_title": f"{artist} - {title}",
+            "offset": None,
+            "source": "instagram_metadata",
+        }
+    except Exception as e:
+        print(f"Could not extract Instagram metadata: {e}")
+
+    return None
+
+
 def download_tiktok_direct_audio(audio_url: str, output_path: Path, source_url: str = "") -> bool:
     """Download audio directly from TikTok's CDN and convert to MP3."""
     import urllib.request
@@ -600,13 +663,18 @@ async def main():
         temp_path = Path(temp_dir)
         source_audio = temp_path / "source.mp3"
 
-        # Step 1: Try to get song info from TikTok metadata (most accurate)
+        # Step 1: Try to get song info from page metadata (most accurate)
         song_info = None
         if "tiktok.com" in url.lower():
             print("Checking TikTok for song metadata...")
             song_info = extract_tiktok_music_metadata(url)
             if song_info:
                 print(f"Found song in TikTok metadata: {song_info['artist']} - {song_info['title']}")
+        elif "instagram.com" in url.lower():
+            print("Checking Instagram for song metadata...")
+            song_info = extract_instagram_music_metadata(url)
+            if song_info:
+                print(f"Found song in Instagram metadata: {song_info['artist']} - {song_info['title']}")
 
         # Step 2: Download audio from source
         if not download_source_audio(url, source_audio):
