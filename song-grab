@@ -245,11 +245,20 @@ def search_youtube(artist: str, title: str) -> str | None:
     """Search YouTube for the song and return the best match URL."""
     print(f"Searching YouTube for: {artist} - {title}...")
 
+    # Clean up artist/title for better search results
+    # Replace & with 'and' as it causes search issues
+    clean_artist = artist.replace("&", "and")
+    clean_title = title.replace("&", "and")
+
     search_queries = [
-        f"{artist} {title} official audio",
-        f"{artist} {title} audio",
-        f"{artist} {title}",
-        f"{title} {artist}",
+        # Quoted exact match attempts first
+        f'"{clean_title}" "{clean_artist}"',
+        f'"{clean_title}" {clean_artist}',
+        # Then standard searches
+        f"{clean_title} {clean_artist}",
+        f"{clean_artist} {clean_title}",
+        f"{clean_artist} {clean_title} official audio",
+        f"{clean_artist} {clean_title} audio",
     ]
 
     for query in search_queries:
