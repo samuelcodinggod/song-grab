@@ -45,6 +45,24 @@ def format_timestamp(seconds: float) -> str:
     return f"{minutes}.{secs:02d}"
 
 
+def set_finder_comment(file_path: Path, comment: str) -> bool:
+    """Set the Finder comment (visible in Get Info) for a file."""
+    import plistlib
+
+    try:
+        # Finder comments are stored as a plist in an extended attribute
+        plist_data = plistlib.dumps(comment)
+        subprocess.run(
+            ["xattr", "-w", "com.apple.metadata:kMDItemFinderComment", plist_data, str(file_path)],
+            capture_output=True,
+            check=True
+        )
+        return True
+    except Exception as e:
+        # Non-fatal - the ID3 comment is still saved
+        return False
+
+
 def check_dependencies():
     """Verify required tools are available."""
     try:
@@ -630,6 +648,7 @@ async def raw_download(url: str):
                 cmd = ["ffmpeg", "-y", "-i", str(temp_audio), "-q:a", "0", "-metadata", f"comment={url}", str(output_path)]
                 subprocess.run(cmd, capture_output=True, check=True)
 
+            set_finder_comment(output_path, url)
             print(f"\nSaved: {output_path}")
             print("Done!")
             sys.exit(0)
@@ -671,6 +690,7 @@ async def raw_download(url: str):
         ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(source_audio), "-q:a", "0", "-metadata", f"comment={url}", str(output_path)]
         subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
 
+        set_finder_comment(output_path, url)
         print(f"\nSaved: {output_path}")
         print("Done!")
         sys.exit(0)
@@ -757,6 +777,7 @@ async def main():
             print("Downloading audio directly from TikTok...")
             downloaded = download_tiktok_direct_audio(song_info["tiktok_audio_url"], output_path, url)
             if downloaded:
+                set_finder_comment(output_path, url)
                 print(f"\nSaved: {output_path}")
                 print("Done!")
             else:
@@ -777,6 +798,7 @@ async def main():
                 print("Failed to download from YouTube.")
                 sys.exit(1)
 
+            set_finder_comment(output_path, url)
             print(f"\nSaved: {output_path}")
             print("Done!")
 
