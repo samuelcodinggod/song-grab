@@ -31,6 +31,14 @@ song-grab 'https://www.instagram.com/reel/ABC123/'
 3. Finds the full song on YouTube
 4. Downloads it as an MP3 to your music folder
 
+## Update
+
+To get the latest version:
+
+```
+song-grab --update
+```
+
 ## Change save location
 
 Edit `~/.config/song-grab/config` to change where songs are saved.

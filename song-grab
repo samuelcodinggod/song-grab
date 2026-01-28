@@ -363,9 +363,41 @@ def download_youtube_mp3(youtube_url: str, output_path: Path) -> bool:
     return output_path.exists()
 
 
+def update_script():
+    """Download and install the latest version from GitHub."""
+    import urllib.request
+
+    GITHUB_RAW_URL = "https://raw.githubusercontent.com/samuelcodinggod/song-grab/main/song-grab"
+
+    try:
+        print("Checking for updates...")
+        req = urllib.request.Request(GITHUB_RAW_URL, headers={"User-Agent": "song-grab"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            new_script = response.read().decode("utf-8")
+
+        # Get the path of the current script
+        script_path = Path(__file__).resolve()
+
+        # Write the new version
+        with open(script_path, "w") as f:
+            f.write(new_script)
+
+        print("Updated to the latest version!")
+        sys.exit(0)
+
+    except Exception as e:
+        print(f"Update failed: {e}")
+        sys.exit(1)
+
+
 async def main():
+    # Handle --update flag
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--update", "-u", "update"):
+        update_script()
+
     if len(sys.argv) < 2:
         print("Usage: song-grab <instagram-reel-or-tiktok-url>")
+        print("       song-grab --update  (update to latest version)")
         print("Example: song-grab 'https://www.instagram.com/reel/ABC123/'")
         print(f"\nSongs are saved to: {OUTPUT_DIR}")
         sys.exit(1)
