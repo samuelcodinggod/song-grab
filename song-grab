@@ -464,12 +464,12 @@ async def raw_download(url: str):
                 # Try to get username from URL
                 username_match = re.search(r'tiktok\.com/@([^/]+)', url)
                 if username_match:
-                    suggested_name = f"original sound - {username_match.group(1)}"
+                    suggested_name = username_match.group(1)
                 else:
                     # Try to get from page metadata
                     author_match = re.search(r'"author":\{[^}]*"uniqueId":"([^"]+)"', html)
                     if author_match:
-                        suggested_name = f"original sound - {author_match.group(1)}"
+                        suggested_name = author_match.group(1)
 
         except Exception as e:
             print(f"Could not extract TikTok data: {e}")
