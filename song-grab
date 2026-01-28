@@ -122,7 +122,7 @@ def extract_tiktok_music_metadata(url: str) -> dict | None:
     return None
 
 
-def download_tiktok_direct_audio(audio_url: str, output_path: Path) -> bool:
+def download_tiktok_direct_audio(audio_url: str, output_path: Path, source_url: str = "") -> bool:
     """Download audio directly from TikTok's CDN and convert to MP3."""
     import urllib.request
 
@@ -142,8 +142,11 @@ def download_tiktok_direct_audio(audio_url: str, output_path: Path) -> bool:
         with open(temp_audio, "wb") as f:
             f.write(audio_data)
 
-        # Convert to mp3 using ffmpeg
-        cmd = ["ffmpeg", "-y", "-i", str(temp_audio), "-q:a", "0", str(output_path)]
+        # Convert to mp3 using ffmpeg with source URL in metadata
+        cmd = ["ffmpeg", "-y", "-i", str(temp_audio), "-q:a", "0"]
+        if source_url:
+            cmd.extend(["-metadata", f"comment={source_url}"])
+        cmd.append(str(output_path))
         subprocess.run(cmd, capture_output=True, check=True)
 
         temp_audio.unlink()
@@ -154,7 +157,7 @@ def download_tiktok_direct_audio(audio_url: str, output_path: Path) -> bool:
         return False
 
 
-def download_tiktok_slideshow_audio(url: str, output_path: Path) -> bool:
+def download_tiktok_slideshow_audio(url: str, output_path: Path, source_url: str = "") -> bool:
     """Download audio from a TikTok slideshow by extracting the audio URL from the page."""
     import urllib.request
 
@@ -192,8 +195,11 @@ def download_tiktok_slideshow_audio(url: str, output_path: Path) -> bool:
         with open(temp_audio, "wb") as f:
             f.write(audio_data)
 
-        # Convert to mp3 using ffmpeg
-        cmd = ["ffmpeg", "-y", "-i", str(temp_audio), "-q:a", "0", str(output_path)]
+        # Convert to mp3 using ffmpeg with source URL in metadata
+        cmd = ["ffmpeg", "-y", "-i", str(temp_audio), "-q:a", "0"]
+        if source_url:
+            cmd.extend(["-metadata", f"comment={source_url}"])
+        cmd.append(str(output_path))
         subprocess.run(cmd, capture_output=True, check=True)
 
         temp_audio.unlink()
@@ -204,14 +210,14 @@ def download_tiktok_slideshow_audio(url: str, output_path: Path) -> bool:
         return False
 
 
-def download_source_audio(url: str, output_path: Path) -> bool:
+def download_source_audio(url: str, output_path: Path, source_url: str = "") -> bool:
     """Download audio from Instagram/TikTok using yt-dlp."""
     print(f"Downloading audio from source...")
 
     # Check if this is a TikTok slideshow (photo post)
     if "tiktok.com" in url.lower() and "/photo/" in url.lower():
         print("Detected TikTok slideshow, using alternate download method...")
-        return download_tiktok_slideshow_audio(url, output_path)
+        return download_tiktok_slideshow_audio(url, output_path, source_url or url)
 
     cmd = [
         "yt-dlp",
@@ -372,16 +378,19 @@ def search_youtube(artist: str, title: str) -> str | None:
     return None
 
 
-def download_youtube_mp3(youtube_url: str, output_path: Path) -> bool:
+def download_youtube_mp3(youtube_url: str, output_path: Path, source_url: str = "") -> bool:
     """Download the YouTube video as MP3."""
     print(f"Downloading MP3...")
+
+    # Download to a temp file first, then add metadata
+    temp_output = output_path.parent / f"temp_{output_path.name}"
 
     cmd = [
         "yt-dlp",
         "-x",
         "--audio-format", "mp3",
         "--audio-quality", "0",
-        "-o", str(output_path),
+        "-o", str(temp_output),
         "--no-playlist",
         "--quiet",
         "--progress",
@@ -393,6 +402,17 @@ def download_youtube_mp3(youtube_url: str, output_path: Path) -> bool:
     if result.returncode != 0:
         print(f"Error downloading from YouTube: {result.stderr}")
         return False
+
+    if not temp_output.exists():
+        return False
+
+    # Re-encode with ffmpeg to add source URL metadata
+    if source_url:
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(temp_output), "-q:a", "0", "-metadata", f"comment={source_url}", str(output_path)]
+        subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
+        temp_output.unlink()
+    else:
+        temp_output.rename(output_path)
 
     return output_path.exists()
 
@@ -495,13 +515,13 @@ async def raw_download(url: str):
             with urllib.request.urlopen(req, timeout=60) as response:
                 audio_data = response.read()
 
-            # Save and convert to mp3
+            # Save and convert to mp3 with source URL metadata
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_audio = Path(temp_dir) / "temp_audio"
                 with open(temp_audio, "wb") as f:
                     f.write(audio_data)
 
-                cmd = ["ffmpeg", "-y", "-i", str(temp_audio), "-q:a", "0", str(output_path)]
+                cmd = ["ffmpeg", "-y", "-i", str(temp_audio), "-q:a", "0", "-metadata", f"comment={url}", str(output_path)]
                 subprocess.run(cmd, capture_output=True, check=True)
 
             print(f"\nSaved: {output_path}")
@@ -536,13 +556,14 @@ async def raw_download(url: str):
             print(f"Error downloading: {result.stderr}")
             sys.exit(1)
 
-        # Save with timestamp name
+        # Save with timestamp name and add source URL metadata
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"tiktok_audio_{timestamp}.mp3"
         output_path = OUTPUT_DIR / filename
 
-        import shutil
-        shutil.copy(source_audio, output_path)
+        # Re-encode with ffmpeg to add metadata
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(source_audio), "-q:a", "0", "-metadata", f"comment={url}", str(output_path)]
+        subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
 
         print(f"\nSaved: {output_path}")
         print("Done!")
@@ -623,7 +644,7 @@ async def main():
 
         if song_info.get("tiktok_audio_url"):
             print("Downloading audio directly from TikTok...")
-            downloaded = download_tiktok_direct_audio(song_info["tiktok_audio_url"], output_path)
+            downloaded = download_tiktok_direct_audio(song_info["tiktok_audio_url"], output_path, url)
             if downloaded:
                 print(f"\nSaved: {output_path}")
                 print("Done!")
@@ -641,7 +662,7 @@ async def main():
 
             print(f"Found on YouTube: {youtube_url}")
 
-            if not download_youtube_mp3(youtube_url, output_path):
+            if not download_youtube_mp3(youtube_url, output_path, url):
                 print("Failed to download from YouTube.")
                 sys.exit(1)
 
