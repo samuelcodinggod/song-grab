@@ -68,8 +68,7 @@ def check_output_directory():
 
 
 def extract_tiktok_music_metadata(url: str) -> dict | None:
-    """Extract song metadata directly from TikTok page (more accurate than Shazam)."""
-    import json
+    """Extract song metadata and audio URL directly from TikTok page."""
     import urllib.request
 
     if "tiktok.com" not in url.lower():
@@ -95,13 +94,15 @@ def extract_tiktok_music_metadata(url: str) -> dict | None:
         # Handle escaped unicode
         music_json = music_json.encode().decode("unicode_escape")
 
-        # Extract title and author using regex (more reliable than JSON parsing here)
+        # Extract title, author, and playUrl
         title_match = re.search(r'"title":"([^"]+)"', music_json)
         author_match = re.search(r'"authorName":"([^"]+)"', music_json)
+        play_url_match = re.search(r'"playUrl":"([^"]+)"', music_json)
 
         if title_match:
             title = title_match.group(1)
             artist = author_match.group(1) if author_match else "Unknown Artist"
+            play_url = play_url_match.group(1) if play_url_match else None
 
             # Skip generic/original sound entries
             if "original sound" in title.lower() or title.startswith("som original"):
@@ -112,12 +113,45 @@ def extract_tiktok_music_metadata(url: str) -> dict | None:
                 "artist": artist,
                 "full_title": f"{artist} - {title}",
                 "offset": None,
-                "source": "tiktok_metadata"
+                "source": "tiktok_metadata",
+                "tiktok_audio_url": play_url  # Direct audio URL from TikTok
             }
     except Exception as e:
         print(f"Could not extract TikTok metadata: {e}")
 
     return None
+
+
+def download_tiktok_direct_audio(audio_url: str, output_path: Path) -> bool:
+    """Download audio directly from TikTok's CDN and convert to MP3."""
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            audio_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+                "Referer": "https://www.tiktok.com/"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=60) as response:
+            audio_data = response.read()
+
+        # Save as temp file, then convert to mp3
+        temp_audio = output_path.parent / "temp_tiktok_audio"
+        with open(temp_audio, "wb") as f:
+            f.write(audio_data)
+
+        # Convert to mp3 using ffmpeg
+        cmd = ["ffmpeg", "-y", "-i", str(temp_audio), "-q:a", "0", str(output_path)]
+        subprocess.run(cmd, capture_output=True, check=True)
+
+        temp_audio.unlink()
+        return output_path.exists()
+
+    except Exception as e:
+        print(f"TikTok direct download error: {e}")
+        return False
 
 
 def download_tiktok_slideshow_audio(url: str, output_path: Path) -> bool:
@@ -453,21 +487,36 @@ async def main():
             print(f"\nSong already exists: {output_path}")
             sys.exit(0)
 
-        youtube_url = search_youtube(artist, title)
+        # Step 4: Download the song
+        # Prefer TikTok direct audio (exact match) over YouTube search
+        downloaded = False
 
-        if not youtube_url:
-            print(f"\nCould not find '{artist} - {title}' on YouTube.")
-            print("Try searching manually.")
-            sys.exit(1)
+        if song_info.get("tiktok_audio_url"):
+            print("Downloading audio directly from TikTok...")
+            downloaded = download_tiktok_direct_audio(song_info["tiktok_audio_url"], output_path)
+            if downloaded:
+                print(f"\nSaved: {output_path}")
+                print("Done!")
+            else:
+                print("Direct TikTok download failed, trying YouTube...")
 
-        print(f"Found on YouTube: {youtube_url}")
+        # Fall back to YouTube if no TikTok audio or download failed
+        if not downloaded:
+            youtube_url = search_youtube(artist, title)
 
-        if not download_youtube_mp3(youtube_url, output_path):
-            print("Failed to download from YouTube.")
-            sys.exit(1)
+            if not youtube_url:
+                print(f"\nCould not find '{artist} - {title}' on YouTube.")
+                print("Try searching manually.")
+                sys.exit(1)
 
-        print(f"\nSaved: {output_path}")
-        print("Done!")
+            print(f"Found on YouTube: {youtube_url}")
+
+            if not download_youtube_mp3(youtube_url, output_path):
+                print("Failed to download from YouTube.")
+                sys.exit(1)
+
+            print(f"\nSaved: {output_path}")
+            print("Done!")
 
 
 if __name__ == "__main__":
