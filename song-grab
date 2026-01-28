@@ -47,16 +47,12 @@ def format_timestamp(seconds: float) -> str:
 
 def set_finder_comment(file_path: Path, comment: str) -> bool:
     """Set the Finder comment (visible in Get Info) for a file."""
-    import plistlib
-
     try:
-        # Finder comments are stored as a plist in an extended attribute
-        plist_data = plistlib.dumps(comment)
-        subprocess.run(
-            ["xattr", "-w", "com.apple.metadata:kMDItemFinderComment", plist_data, str(file_path)],
-            capture_output=True,
-            check=True
-        )
+        # Use AppleScript to set Finder comment - more reliable than xattr
+        escaped_path = str(file_path).replace('"', '\\"')
+        escaped_comment = comment.replace('\\', '\\\\').replace('"', '\\"')
+        script = f'tell application "Finder" to set comment of (POSIX file "{escaped_path}" as alias) to "{escaped_comment}"'
+        subprocess.run(["osascript", "-e", script], capture_output=True, check=True)
         return True
     except Exception as e:
         # Non-fatal - the ID3 comment is still saved
