@@ -1,7 +1,7 @@
-#!/bin/bash
+#!/bin/zsh
 #
 # song-grab installer
-# Run with: curl -fsSL https://raw.githubusercontent.com/samuelcodinggod/song-grab/main/install.sh | bash
+# Run with: curl -fsSL https://raw.githubusercontent.com/samuelcodinggod/song-grab/master/install.sh | zsh
 #
 
 set -e
@@ -57,7 +57,7 @@ mkdir -p "$SCRIPTS_DIR"
 
 # Download the script
 echo "Downloading song-grab..."
-curl -fsSL "https://raw.githubusercontent.com/samuelcodinggod/song-grab/main/song-grab" -o "$SCRIPTS_DIR/song-grab"
+curl -fsSL "https://raw.githubusercontent.com/samuelcodinggod/song-grab/master/song-grab" -o "$SCRIPTS_DIR/song-grab"
 chmod +x "$SCRIPTS_DIR/song-grab"
 
 # Add Scripts to PATH if not already there

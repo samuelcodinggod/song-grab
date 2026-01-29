@@ -7,7 +7,7 @@ Grab songs from TikTok and Instagram Reels. Identifies the song, finds it on You
 Open Terminal and paste this command:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/samuelcodinggod/song-grab/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/samuelcodinggod/song-grab/master/install.sh | zsh
 ```
 
 It will ask where you want to save songs (just press Enter for the default).
