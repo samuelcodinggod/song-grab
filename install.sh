@@ -1,7 +1,6 @@
 #!/bin/zsh
 #
 # song-grab installer
-# Run with: curl -fsSL https://raw.githubusercontent.com/samuelcodinggod/song-grab/master/install.sh | zsh
 #
 
 set -e
@@ -17,18 +16,25 @@ if [[ "$(uname)" != "Darwin" ]]; then
     exit 1
 fi
 
-# Install Homebrew if not present
+# Check for Homebrew - if missing, tell user to install it first
 if ! command -v brew &> /dev/null; then
-    echo "Installing Homebrew (Mac package manager)..."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    echo "Homebrew is not installed."
+    echo ""
+    echo "Please install Homebrew first by running this command:"
+    echo ""
+    echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+    echo ""
+    echo "That will ask for your Mac password (nothing shows when you type - that's normal)."
+    echo ""
+    echo "After Homebrew is installed, run the song-grab installer again."
+    exit 1
+fi
 
-    # Add Homebrew to PATH for Apple Silicon Macs
-    if [[ -f "/opt/homebrew/bin/brew" ]]; then
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-        echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
-    fi
-else
-    echo "Homebrew already installed."
+echo "Homebrew found."
+
+# Add Homebrew to PATH for Apple Silicon Macs (in case it's not loaded)
+if [[ -f "/opt/homebrew/bin/brew" ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
 fi
 
 # Install yt-dlp
@@ -72,18 +78,8 @@ if ! grep -q 'Scripts' "$SHELL_RC" 2>/dev/null; then
     echo 'export PATH="$HOME/Scripts:$PATH"' >> "$SHELL_RC"
 fi
 
-# Ask for output directory
-echo ""
-echo "Where do you want to save downloaded songs?"
-echo "(Press Enter for default: ~/Music/SongGrab)"
-read -r OUTPUT_DIR
-
-if [[ -z "$OUTPUT_DIR" ]]; then
-    OUTPUT_DIR="$HOME/Music/SongGrab"
-else
-    # Expand ~ to home directory
-    OUTPUT_DIR="${OUTPUT_DIR/#\~/$HOME}"
-fi
+# Set default output directory (no interactive prompt - doesn't work when piped)
+OUTPUT_DIR="$HOME/Music/SongGrab"
 
 # Create config directory and save setting
 mkdir -p "$HOME/.config/song-grab"
@@ -104,5 +100,5 @@ echo "  1. Open a new Terminal window, OR"
 echo "  2. Run: source ~/.zshrc"
 echo ""
 echo "Then grab a song with:"
-echo "  song-grab 'https://www.tiktok.com/...'"
+echo '  song-grab "https://www.tiktok.com/..."'
 echo ""
