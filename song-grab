@@ -541,7 +541,7 @@ def update_script():
     """Download and install the latest version from GitHub."""
     import urllib.request
 
-    GITHUB_RAW_URL = "https://raw.githubusercontent.com/samuelcodinggod/song-grab/main/song-grab"
+    GITHUB_RAW_URL = "https://raw.githubusercontent.com/samuelcodinggod/song-grab/master/song-grab"
 
     try:
         print("Checking for updates...")
