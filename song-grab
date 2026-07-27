@@ -1,40 +1,563 @@
-#!/usr/bin/env python3
+#!/bin/sh
+# Run under a Python that actually has the deps: prefer 3.13 if present, else
+# whatever python3 the installer set up. This line is valid sh AND valid Python
+# - sh execs it, Python just sees a bare string expression.
+"exec" "$(command -v python3.13 || command -v python3)" "$0" "$@"
 """
 song-grab: Extract songs from Instagram Reels and TikTok videos.
 
-Usage: song-grab "https://instagram.com/reel/..." or "https://tiktok.com/..."
+Usage: song-grab              (prompts for URL - no quotes needed)
+       song-grab <url>        (pass URL directly - requires quotes)
+       song-grab <file>       (local video/audio file - extracts its audio + identifies)
+       song-grab --reindex    (rebuild every folder's "_Song Links.rtf")
+       song-grab --relink     (re-find moved local source videos, then reindex)
+       song-grab --watch      (background: auto-sync sources as songs are moved)
 
 Downloads the audio, identifies the song via Shazam, finds it on YouTube,
-and saves the MP3 to your music folder.
+and saves the MP3 FLAT into ~/Main/Music. Each source URL is recorded in a
+hidden ledger (.song_links.tsv) AND stamped into the file's Finder comment, so
+it follows the file when dragged — or even duplicated/renamed — into a category
+folder; every folder gets a clickable "_Song Links.rtf" index plus a "_Sources"
+folder of double-clickable shortcuts. Run --reindex after re-sorting songs to
+refresh the indexes, or leave --watch running (via the launchd agent
+com.samgritton.song-sources) so it happens automatically. A local source
+shortcut is a symlink, so if you move the source video its shortcut breaks —
+--reindex/--relink self-heals it by re-finding the file by name (Music tree,
+then Spotlight across ~/Main).
 """
 
 import asyncio
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
-# Load output directory from config file
+# --- TLS CA bundle ---------------------------------------------------------
+# The python.org framework Python ships with no default cert.pem, so HTTPS
+# verification fails (CERTIFICATE_VERIFY_FAILED). Point OpenSSL at certifi's
+# bundle (installed alongside this interpreter) so urllib, requests and
+# aiohttp/shazam all verify. Set before any network library builds a context.
+if not os.environ.get("SSL_CERT_FILE"):
+    try:
+        import certifi
+        _ca = certifi.where()
+        os.environ["SSL_CERT_FILE"] = _ca
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", _ca)
+    except Exception:
+        pass
+
+# Output directory for downloaded songs. Read from a config file rather than
+# hardcoded, so `song --update` (which pulls this script from GitHub) can never
+# drag someone else's music folder onto this machine — and so the published copy
+# carries no personal path. Sam's config points at ~/Main/Music.
 CONFIG_FILE = Path.home() / ".config" / "song-grab" / "config"
 
+
 def get_output_dir() -> Path:
-    """Get the output directory from config file."""
+    """Get the output directory from the config file."""
     if CONFIG_FILE.exists():
         output_dir = CONFIG_FILE.read_text().strip()
         if output_dir:
-            return Path(output_dir)
-    # Default fallback
-    return Path.home() / "Music" / "SongGrab"
+            return Path(output_dir).expanduser()
+    return Path.home() / "Music" / "SongGrab"    # default for a fresh install
+
 
 OUTPUT_DIR = get_output_dir()
+
+# Which variants to grab for every search-based download. Each run saves BOTH
+# the instrumental backing track ("Title (instrumental).mp3") and the normal
+# with-vocals version ("Title.mp3"). Order matters only for console output.
+DOWNLOAD_VARIANTS = [True, False]  # True = instrumental, False = normal (vocals)
+
+# --- Flat library + clickable song-links index (2026-06) -------------------
+# Songs are saved FLAT in OUTPUT_DIR (no per-song wrapper folder) so they're
+# easy to preview. Each source URL is recorded in a hidden ledger keyed by
+# *filename*, so the link survives when the file is dragged into a category
+# subfolder. Every folder gets a clickable "_Song Links.rtf" (song name =
+# hyperlink to its source video), regenerated from the ledger by reindex_all().
+LEDGER_PATH = OUTPUT_DIR / ".song_links.tsv"
+INDEX_NAME = "_Song Links.rtf"
+SOURCES_DIRNAME = "_Sources"   # per-folder folder of double-clickable source shortcuts
+AUDIO_EXTS = {".mp3", ".m4a", ".mp4"}
+
+
+def ledger_load() -> dict:
+    links: dict = {}
+    if LEDGER_PATH.exists():
+        for line in LEDGER_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "\t" in line:
+                name, url = line.split("\t", 1)
+                if name:
+                    links[name] = url
+    return links
+
+
+def ledger_set(filename: str, url: str) -> None:
+    if not url:
+        return
+    links = ledger_load()
+    links[filename] = url
+    lines = [f"{n}\t{u}" for n, u in sorted(links.items(), key=lambda kv: kv[0].lower())]
+    LEDGER_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _rtf_escape(s: str) -> str:
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "{":
+            out.append("\\{")
+        elif ch == "}":
+            out.append("\\}")
+        elif o < 128:
+            out.append(ch)
+        elif o <= 0xFFFF:
+            out.append("\\u%d?" % (o if o < 32768 else o - 65536))
+        else:
+            o2 = o - 0x10000
+            for s16 in (0xD800 + (o2 >> 10), 0xDC00 + (o2 & 0x3FF)):
+                out.append("\\u%d?" % (s16 if s16 < 32768 else s16 - 65536))
+    return "".join(out)
+
+
+def _short_url(u: str) -> str:
+    """Display label for a source under a song name. Web URLs are shortened to
+    host+path; local sources (a file:// URL or a bare path) show just the source
+    file's name, so the row reads e.g. 'pinterest_1234 copy.mp4'."""
+    s = (u or "").strip()
+    low = s.lower()
+    if low.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        return Path(unquote(urlparse(s).path)).name
+    if s.startswith(("/", "~")):
+        return Path(s).expanduser().name
+    for p in ("https://", "http://"):
+        if s.startswith(p):
+            s = s[len(p):]
+    if s.startswith("www."):
+        s = s[4:]
+    s = s.split("?")[0].rstrip("/")
+    return s if len(s) <= 64 else s[:63] + "…"
+
+
+def _link_target(u: str) -> str:
+    """Turn a stored source into a clickable hyperlink target. A bare local
+    path can't be opened from a hyperlink — a path containing a space fails
+    with Finder error -50 — so local paths become percent-encoded file:// URLs
+    (e.g. '/…/foo copy.mp4' -> 'file:///…/foo%20copy.mp4'). Real URLs (http/
+    https/file) pass through unchanged."""
+    s = (u or "").strip()
+    if s.lower().startswith(("http://", "https://", "file://")):
+        return s
+    try:
+        return Path(s).expanduser().as_uri()
+    except ValueError:
+        return s  # not an absolute path — leave as-is
+
+
+def _build_index_rtf(title: str, entries: list) -> str:
+    head = (r"{\rtf1\ansi\ansicpg1252\cocoartf2700"
+            r"{\fonttbl\f0\fswiss\fcharset0 Helvetica;\f1\fswiss\fcharset0 Helvetica-Bold;}"
+            r"{\colortbl;\red0\green0\blue0;\red20\green80\blue200;\red140\green140\blue140;}"
+            r"\margl1440\margr1440\f0\fs24" "\n")
+    n = len(entries)
+    body = [r"{\f1\fs40\cf1 " + _rtf_escape(title) + r"}\line "
+            + r"{\f0\fs20\cf3 " + f"{n} song" + ("" if n == 1 else "s")
+            + r" \'b7 click a song to open its source video}\line\line " + "\n"]
+    q = chr(34)
+    for name, url in entries:
+        nm = _rtf_escape(name)
+        if url:
+            u = _rtf_escape(_link_target(url))
+            link = r"{\field{\*\fldinst{HYPERLINK " + q + u + q + r"}}{\fldrslt "
+            body.append(link + r"{\f1\fs28\cf2\ul " + nm + r"}}}\line" + "\n")
+            body.append(r"\tab " + link + r"{\f0\fs18\cf3\ul "
+                        + _rtf_escape(_short_url(url)) + r"}}}\line\line" + "\n")
+        else:
+            body.append(r"{\f1\fs28\cf1 " + nm + r"}\line" + "\n")
+            body.append(r"\tab {\f0\fs18\cf3 (no source saved)}\line\line" + "\n")
+    return head + "".join(body) + "}\n"
+
+
+def _source_local_path(url: str) -> Path | None:
+    """The local filesystem Path a source points to (bare path or file:// URL),
+    or None if it's a web URL / empty."""
+    s = (url or "").strip()
+    if not s or s.lower().startswith(("http://", "https://")):
+        return None
+    if s.lower().startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        s = unquote(urlparse(s).path)
+    return Path(s).expanduser() if s.startswith(("/", "~")) else None
+
+
+def _find_moved_source(base: str) -> Path | None:
+    """Locate a local source that was moved, by its filename. Symlinks point at
+    a fixed path, so dragging the source video into a subfolder breaks them;
+    this re-finds the file wherever it now lives. Looks first inside the Music
+    tree (fast, exact filename match — no glob-metachar pitfalls), then falls
+    back to Spotlight across all of ~/Main. Returns None if it can't be found."""
+    for root, dirs, files in os.walk(OUTPUT_DIR):   # followlinks=False: no loops
+        if base in files:
+            return Path(root) / base
+    try:
+        out = subprocess.run(
+            ["mdfind", "-onlyin", str(OUTPUT_DIR.parent),
+             f'kMDItemFSName == "{base}"'],
+            capture_output=True, text=True, timeout=10).stdout.splitlines()
+        for line in out:
+            cand = Path(line)
+            if cand.is_file():
+                return cand
+    except Exception:
+        pass
+    return None
+
+
+def relink_ledger() -> int:
+    """Self-heal local sources that were moved. For every ledger entry whose
+    source is a local file no longer at the recorded path, re-find it by name
+    and rewrite the ledger to its new location, so the _Sources shortcuts (and
+    the .rtf links) rebuild against a live file. Web sources are left alone.
+    Returns the count repaired; prints a one-line summary."""
+    links = ledger_load()
+    fixed, missing = 0, []
+    for name, url in list(links.items()):
+        local = _source_local_path(url)
+        if local is None or local.exists():
+            continue                       # web source, or still valid
+        found = _find_moved_source(local.name)
+        if found is not None:
+            links[name] = str(found)
+            fixed += 1
+        else:
+            missing.append(local.name)
+    if fixed:
+        lines = [f"{n}\t{u}" for n, u in sorted(links.items(), key=lambda kv: kv[0].lower())]
+        LEDGER_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if fixed or missing:
+        msg = f"Relinked {fixed} moved source" + ("" if fixed == 1 else "s")
+        if missing:
+            msg += f"; {len(missing)} still missing ({', '.join(missing[:3])}" \
+                   + (", …" if len(missing) > 3 else "") + ")"
+        print(msg + ".")
+    return fixed
+
+
+def _clean_sources_dir(sources_dir: Path) -> None:
+    """Remove only the shortcuts we manage (symlinks + .webloc files) from a
+    _Sources folder, so a rebuild reflects renames/removals without disturbing
+    anything else the user may have put there."""
+    if not sources_dir.is_dir():
+        return
+    for p in sources_dir.iterdir():
+        try:
+            if p.is_symlink() or p.suffix.lower() == ".webloc":
+                p.unlink()
+        except OSError:
+            pass
+
+
+def build_folder_sources(folder: Path, entries: list) -> None:
+    """(Re)build folder/_Sources — a folder of double-clickable shortcuts to
+    each song's source. A local source becomes a symlink (double-click opens
+    the video in your default player); a web source becomes a .webloc (opens
+    the link in your browser). This is the reliable way to jump from a song to
+    its source, because TextEdit and Chrome both refuse to open local file://
+    links. Songs with no saved (or missing) source are skipped."""
+    import plistlib
+    sources_dir = folder / SOURCES_DIRNAME
+    shortcuts = []  # (song_name, kind, value)  kind: "link" -> Path, "webloc" -> url
+    for name, url in entries:
+        local = _source_local_path(url)
+        if local is not None:
+            if local.exists():
+                shortcuts.append((name, "link", local))
+        elif (url or "").strip().lower().startswith(("http://", "https://")):
+            shortcuts.append((name, "webloc", url.strip()))
+    if not shortcuts:                       # nothing to link — drop a stale _Sources
+        _clean_sources_dir(sources_dir)
+        try:
+            sources_dir.rmdir()             # only succeeds if it's now empty
+        except OSError:
+            pass
+        return
+    sources_dir.mkdir(exist_ok=True)
+    _clean_sources_dir(sources_dir)
+    used: set = set()
+
+    def _dest(base: str, suffix: str) -> Path:
+        safe = base.replace("/", "-").replace(":", "-").strip() or "source"
+        cand = safe + suffix
+        i = 2
+        while cand in used or (sources_dir / cand).exists():
+            cand = f"{safe} ({i}){suffix}"
+            i += 1
+        used.add(cand)
+        return sources_dir / cand
+
+    for name, kind, value in shortcuts:
+        try:
+            if kind == "link":
+                _dest(name, value.suffix or ".mp4").symlink_to(value)
+            else:
+                _dest(name, ".webloc").write_bytes(plistlib.dumps({"URL": value}))
+        except OSError:
+            pass
+
+
+# Resolving a song's source when its filename isn't an exact ledger key — so a
+# DUPLICATED file ("song copy.mp3") or even a RENAMED one still finds its source.
+# finalize_song() stamps the source URL into each file's Finder comment, so the
+# source rides along *inside the file* through any Finder copy/rename; we read
+# that as the authoritative fallback, then fall back to a copy/number-suffix-
+# stripped ledger lookup.
+_FINDER_COMMENT_XATTR = "com.apple.metadata:kMDItemFinderComment"
+_COPY_SUFFIX_RE = re.compile(r"^(.*?)(?: copy(?: \d+)?| \d+)$")
+
+
+_HEX_LINE_RE = re.compile(r"^[0-9A-Fa-f]{2}( [0-9A-Fa-f]{2})*$")
+
+
+def _decode_finder_comment(hexstr: str) -> str:
+    """Turn `xattr -px` hex into the source it holds (macOS stores the Finder
+    comment as a binary plist). Returns '' if it isn't a source."""
+    hexstr = hexstr.replace(" ", "").replace("\n", "").strip()
+    if not hexstr:
+        return ""
+    try:
+        raw = bytes.fromhex(hexstr)
+    except ValueError:
+        return ""
+    val = ""
+    try:
+        import plistlib
+        obj = plistlib.loads(raw)
+        if isinstance(obj, str):
+            val = obj
+    except Exception:
+        val = ""
+    if not val:                                  # not a clean string plist — dig it out
+        txt = raw.decode("utf-8", "ignore")
+        m = re.search(r"(https?://\S+|file://\S+|/[^\x00]+\.(?:mp4|mov|m4v|mkv|webm))", txt)
+        val = m.group(1) if m else ""
+    val = (val or "").strip()
+    low = val.lower()
+    if low.startswith(("http://", "https://", "file://")) or val.startswith(("/", "~")):
+        return val
+    return ""
+
+
+def _finder_comment_source(path: Path) -> str:
+    """The source URL/path stamped into a file's Finder comment by
+    finalize_song() — or pasted in by hand in Get Info. Read via `xattr`
+    (macOS stores it as a binary plist, which rides along inside the file when
+    it's duplicated/renamed in Finder — that's what lets a song carry its
+    source with it). os.getxattr is Linux-only, so we shell out."""
+    try:
+        out = subprocess.run(["xattr", "-px", _FINDER_COMMENT_XATTR, str(path)],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ""
+    if out.returncode != 0:
+        return ""
+    return _decode_finder_comment(out.stdout)
+
+
+def _finder_comments_batch(paths: list) -> dict:
+    """Finder comments for many files in ONE `xattr` call — ~30ms for the whole
+    library, versus a subprocess per file. Returns {path_str: source}; files
+    with no comment (they land on stderr) are simply absent.
+
+    With several files `xattr -px` prints a "<path>: " header before each file's
+    hex block; with exactly one it prints the hex bare, so seed `current`."""
+    if not paths:
+        return {}
+    paths = [str(p) for p in paths]
+    try:
+        out = subprocess.run(["xattr", "-px", _FINDER_COMMENT_XATTR] + paths,
+                             capture_output=True, text=True, timeout=120)
+    except Exception:
+        return {}
+
+    comments: dict = {}
+    current = paths[0] if len(paths) == 1 else None
+    hexbuf: list = []
+
+    def flush():
+        if current is None:
+            return
+        val = _decode_finder_comment("".join(hexbuf))
+        if val:
+            comments[current] = val
+
+    for raw in out.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if _HEX_LINE_RE.match(line):
+            hexbuf.append(line)
+        elif line.endswith(":"):
+            flush()
+            current, hexbuf = line[:-1], []
+    flush()
+    return comments
+
+
+def _strip_copy_suffix(stem: str) -> str:
+    """'song copy' / 'song copy 2' / 'song 2' -> 'song'  (else '')."""
+    m = _COPY_SUFFIX_RE.match(stem)
+    base = m.group(1).strip() if m else ""
+    return base if base and base != stem else ""
+
+
+def _resolve_source(audio: Path, links: dict, comments: dict | None = None) -> str:
+    """Best source for a song file sitting in a category folder, even if it was
+    duplicated or renamed.
+
+    The Finder comment WINS over the ledger. That's deliberate: Get Info is the
+    field edited by hand when a download turned out to be the wrong song — grab
+    the right track off YouTube, then paste the original reel/TikTok URL into
+    its Get Info. That hand-pasted URL is the correction, so it has to beat the
+    ledger's stale (usually YouTube) entry, otherwise the _Sources shortcut
+    keeps pointing at YouTube instead of the reel the editors need.
+
+    Order: Finder comment (survives copy/rename) -> exact ledger key ->
+    copy/number-suffix-stripped ledger lookup. '' if nothing is found."""
+    embedded = (comments.get(str(audio), "") if comments is not None
+                else _finder_comment_source(audio))
+    if embedded:
+        return embedded
+    exact = links.get(audio.name)
+    if exact:
+        return exact
+    base = _strip_copy_suffix(audio.stem)
+    if base:
+        return links.get(base + audio.suffix, "")
+    return ""
+
+
+def _all_audio_paths() -> list:
+    """Every song under the Music tree, skipping dotfiles and _Sources."""
+    out = []
+    for root, dirs, files in os.walk(OUTPUT_DIR):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d != SOURCES_DIRNAME]
+        for f in files:
+            if not f.startswith(".") and Path(f).suffix.lower() in AUDIO_EXTS:
+                out.append(os.path.join(root, f))
+    return out
+
+
+def build_folder_index(folder: Path, links: dict | None = None,
+                       comments: dict | None = None) -> None:
+    """(Re)write folder/_Song Links.rtf and folder/_Sources for the audio files
+    directly inside `folder`. Removes both if the folder has no audio."""
+    if links is None:
+        links = ledger_load()
+    audio = sorted((p for p in folder.iterdir()
+                    if p.is_file() and p.suffix.lower() in AUDIO_EXTS),
+                   key=lambda p: p.stem.lower())
+    index_path = folder / INDEX_NAME
+    if not audio:
+        if index_path.exists():
+            index_path.unlink()
+        build_folder_sources(folder, [])
+        return
+    title = "Music — unsorted" if folder == OUTPUT_DIR else folder.name
+
+    entries = []
+    for p in audio:
+        src = _resolve_source(p, links, comments)
+        entries.append((p.stem, src))
+        # A hand-edited Get Info comment is a correction — fold it back into the
+        # ledger so the .rtf index, _Sources and later reindexes all agree.
+        if src and links.get(p.name) != src:
+            ledger_set(p.name, src)
+            links[p.name] = src
+
+    index_path.write_text(_build_index_rtf(title, entries), encoding="utf-8")
+    build_folder_sources(folder, entries)
+
+
+def reindex_all() -> None:
+    """Rebuild every _Song Links.rtf — the Music root (unsorted inbox) plus
+    each category subfolder — from the ledger. First self-heals any local
+    sources that were moved, so their shortcuts rebuild against live files."""
+    relink_ledger()
+    links = ledger_load()
+    comments = _finder_comments_batch(_all_audio_paths())   # one call, ~30ms
+    build_folder_index(OUTPUT_DIR, links, comments)
+    for sub in sorted(OUTPUT_DIR.iterdir()):
+        if sub.is_dir() and not sub.name.startswith(".") and sub.name != SOURCES_DIRNAME:
+            build_folder_index(sub, links, comments)
+    print("Reindexed song links.")
+
+
+def _audio_layout_signature() -> frozenset:
+    """Snapshot of where every song lives AND what source each one claims — the
+    set of (audio path, Finder comment) pairs under the Music tree, skipping
+    dotfiles and the generated _Sources folders (so our own rebuilds never look
+    like a change). Comparing two snapshots tells the watcher a song was moved,
+    copied or renamed — and, because the comment is in the pair, that a source
+    was edited by hand in Get Info, which must repoint its _Sources shortcut.
+    The comments come from one batched xattr call, so the poll stays cheap."""
+    paths = _all_audio_paths()
+    comments = _finder_comments_batch(paths)
+    return frozenset((p, comments.get(p, "")) for p in paths)
+
+
+def watch_loop(interval: float = 2.0, settle: float = 2.0) -> None:
+    """Watch the Music tree and re-sync every folder's _Sources/_Song Links.rtf
+    whenever songs move between folders — so a song dragged or duplicated into a
+    new category automatically gets its source shortcut there. Polls the (cheap)
+    audio layout, waits for a drag to settle, then runs reindex_all(). Runs
+    forever; the launchd agent (KeepAlive) restarts it if it ever exits. The
+    signature ignores _Sources/.rtf/dotfiles, so reindex's own writes can't
+    retrigger it."""
+    import time
+    print(f"[song --watch] watching {OUTPUT_DIR} (poll {interval}s)", flush=True)
+    try:
+        reindex_all()                       # catch up on moves made while it was off
+    except Exception as e:
+        print(f"[song --watch] initial reindex failed: {e}", flush=True)
+    last = _audio_layout_signature()
+    while True:
+        time.sleep(interval)
+        try:
+            cur = _audio_layout_signature()
+        except Exception:
+            continue
+        if cur == last:
+            continue
+        while True:                         # wait until the layout stops changing
+            time.sleep(settle)
+            try:
+                nxt = _audio_layout_signature()
+            except Exception:
+                break
+            if nxt == cur:
+                break
+            cur = nxt
+        try:
+            reindex_all()
+            print(f"[song --watch] re-synced ({len(cur)} songs)", flush=True)
+        except Exception as e:
+            print(f"[song --watch] reindex failed: {e}", flush=True)
+        last = cur
 
 
 def sanitize_filename(name: str) -> str:
     """Remove characters that are invalid in filenames."""
+    # Replace problematic characters with safe alternatives
     name = re.sub(r'[<>:"/\\|?*]', '', name)
-    name = re.sub(r'\s+', ' ', name)
+    name = re.sub(r'\s+', ' ', name)  # Collapse multiple spaces
     return name.strip()
 
 
@@ -59,6 +582,53 @@ def set_finder_comment(file_path: Path, comment: str) -> bool:
         return False
 
 
+def already_downloaded(output_path: Path) -> Path | None:
+    """Return the existing path if the song was already downloaded — either
+    at the original location, or wrapped into a folder by finalize_song().
+    Returns None if not found."""
+    if output_path.exists():
+        return output_path
+    wrapped = output_path.parent / output_path.stem / output_path.name
+    if wrapped.exists():
+        return wrapped
+    return None
+
+
+def finalize_song(audio_path: Path, source_url: str, reindex: bool = True) -> Path:
+    """Register a freshly-downloaded song. The file stays FLAT where it is
+    (in OUTPUT_DIR) — no per-song wrapper folder. We record its source URL in
+    the links ledger (keyed by filename, so it follows the file when dragged
+    into a category), embed the URL as a Finder comment as a backup, and
+    refresh the clickable _Song Links.rtf indexes. Returns the audio path.
+    """
+    ledger_set(audio_path.name, source_url)
+    set_finder_comment(audio_path, source_url)
+    if reindex:
+        reindex_all()
+    return audio_path
+
+
+def save_failed_url(url: str) -> Path:
+    """Record a URL we couldn't identify into OUTPUT_DIR/failed/ as a .txt
+    file, so it can be retried later. Filename uses the post shortcode/video-id
+    when extractable, otherwise a timestamp."""
+    failed_dir = OUTPUT_DIR / "failed"
+    failed_dir.mkdir(parents=True, exist_ok=True)
+
+    ig_match = re.search(r'instagram\.com/(?:reel|reels|p|tv)/([^/?#]+)', url)
+    tt_match = re.search(r'tiktok\.com/.*?/video/(\d+)', url)
+    if ig_match:
+        ident = f"instagram_{ig_match.group(1)}"
+    elif tt_match:
+        ident = f"tiktok_{tt_match.group(1)}"
+    else:
+        ident = datetime.now().strftime("failed_%Y%m%d_%H%M%S")
+
+    failed_path = failed_dir / f"{ident}.txt"
+    failed_path.write_text(url + "\n", encoding="utf-8")
+    return failed_path
+
+
 def check_dependencies():
     """Verify required tools are available."""
     try:
@@ -75,10 +645,11 @@ def check_dependencies():
 
 
 def check_output_directory():
-    """Ensure the output directory exists."""
+    """Ensure the output directory exists and is accessible."""
     if not OUTPUT_DIR.exists():
-        print(f"Creating output directory: {OUTPUT_DIR}")
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Error: Output directory not found: {OUTPUT_DIR}")
+        print("Make sure your external drive is connected.")
+        sys.exit(1)
 
 
 def extract_tiktok_music_metadata(url: str) -> dict | None:
@@ -118,7 +689,12 @@ def extract_tiktok_music_metadata(url: str) -> dict | None:
             artist = author_match.group(1) if author_match else "Unknown Artist"
             play_url = play_url_match.group(1) if play_url_match else None
 
-            # Skip generic/original sound entries
+            # Skip original sound entries (language-independent boolean check)
+            original_match = re.search(r'"original"\s*:\s*(true|false)', music_json)
+            if original_match and original_match.group(1) == "true":
+                return None
+
+            # Fallback: skip by title string matching
             if "original sound" in title.lower() or title.startswith("som original"):
                 return None
 
@@ -137,18 +713,23 @@ def extract_tiktok_music_metadata(url: str) -> dict | None:
 
 
 def extract_instagram_music_metadata(url: str) -> dict | None:
-    """Extract song metadata from Instagram reel using instaloader."""
+    """Extract song metadata from Instagram reel. Tries embed page first (fast),
+    then falls back to instaloader (slower, often gets 403)."""
     if "instagram.com" not in url.lower():
         return None
 
+    # Try embed page first — fast, no login needed
+    result = _extract_instagram_music_from_embed(url)
+    if result:
+        return result
+
+    # Fall back to instaloader
     try:
         import instaloader
     except ImportError:
-        print("instaloader not installed, trying embed fallback...")
-        return _extract_instagram_music_from_embed(url)
+        return None
 
     try:
-        # Extract shortcode from URL
         shortcode_match = re.search(r'/(p|reel|reels)/([A-Za-z0-9_-]+)', url)
         if not shortcode_match:
             return None
@@ -158,11 +739,9 @@ def extract_instagram_music_metadata(url: str) -> dict | None:
         L = instaloader.Instaloader()
         post = instaloader.Post.from_shortcode(L.context, shortcode)
 
-        # Check for music attribution info in the raw node data
         if hasattr(post, '_node') and 'clips_music_attribution_info' in post._node:
             music_info = post._node['clips_music_attribution_info']
 
-            # Skip if it uses original audio
             if music_info.get('uses_original_audio', True):
                 return None
 
@@ -181,15 +760,14 @@ def extract_instagram_music_metadata(url: str) -> dict | None:
                 "audio_id": music_info.get('audio_id'),
             }
     except Exception as e:
-        print(f"Could not extract Instagram metadata via instaloader: {e}")
-        # Fall back to embed page method
-        return _extract_instagram_music_from_embed(url)
+        pass
 
     return None
 
 
 def _extract_instagram_music_from_embed(url: str) -> dict | None:
     """Fallback: Extract song metadata from Instagram reel embed page."""
+    import json
     import urllib.request
 
     try:
@@ -209,7 +787,30 @@ def _extract_instagram_music_from_embed(url: str) -> dict | None:
         with urllib.request.urlopen(req, timeout=30) as response:
             html = response.read().decode("utf-8")
 
-        # Look for music info in HeaderSecondaryContent
+        # Method 1: Parse clips_music_attribution_info from embedded JSON
+        json_match = re.search(
+            r'"clips_music_attribution_info":\{[^}]*"artist_name":"([^"]+)"[^}]*"song_name":"([^"]+)"[^}]*"uses_original_audio":(true|false)',
+            html
+        )
+        if json_match:
+            artist = json_match.group(1).encode().decode("unicode_escape")
+            title = json_match.group(2).encode().decode("unicode_escape")
+            uses_original = json_match.group(3) == "true"
+
+            if uses_original:
+                return None
+            if "original sound" in title.lower() or "original audio" in title.lower():
+                return None
+
+            return {
+                "title": title,
+                "artist": artist,
+                "full_title": f"{artist} - {title}",
+                "offset": None,
+                "source": "instagram_metadata",
+            }
+
+        # Method 2: Parse HeaderSecondaryContent HTML (older format)
         match = re.search(r'HeaderSecondaryContent[^>]*><span>([^<]+)</span>', html)
         if not match:
             return None
@@ -279,6 +880,7 @@ def download_tiktok_direct_audio(audio_url: str, output_path: Path, source_url: 
 
 def download_tiktok_slideshow_audio(url: str, output_path: Path, source_url: str = "") -> bool:
     """Download audio from a TikTok slideshow by extracting the audio URL from the page."""
+    import json
     import urllib.request
 
     try:
@@ -330,6 +932,44 @@ def download_tiktok_slideshow_audio(url: str, output_path: Path, source_url: str
         return False
 
 
+def resolve_local_path(s: str) -> Path | None:
+    """If `s` points to an existing local media file, return its resolved Path,
+    else None. Handles file:// URLs, ~ expansion, surrounding quotes, and
+    backslash-escaped spaces (drag-and-drop / shell-style paths)."""
+    raw = (s or "").strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        raw = unquote(urlparse(raw).path)
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        raw = raw[1:-1]
+    candidates = [raw]
+    if "\\" in raw:
+        candidates.append(re.sub(r"\\(.)", r"\1", raw))  # un-escape "\ " etc.
+    for c in candidates:
+        p = Path(c).expanduser()
+        if p.is_file():
+            return p.resolve()
+    return None
+
+
+def extract_local_audio(file_path: Path, output_path: Path) -> bool:
+    """Extract/transcode audio from a local media file (video OR audio) to mp3."""
+    print(f"Extracting audio from local file: {file_path.name}")
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(file_path),
+        "-vn", "-ac", "1", "-ar", "44100", "-b:a", "192k",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error extracting audio: {result.stderr.strip()[:300]}")
+        return False
+    return output_path.exists()
+
+
 def download_source_audio(url: str, output_path: Path, source_url: str = "") -> bool:
     """Download audio from Instagram/TikTok using yt-dlp."""
     print(f"Downloading audio from source...")
@@ -341,7 +981,7 @@ def download_source_audio(url: str, output_path: Path, source_url: str = "") -> 
 
     cmd = [
         "yt-dlp",
-        "--cookies-from-browser", "safari",
+        "--cookies-from-browser", "chrome",
         "-x",
         "--audio-format", "mp3",
         "--audio-quality", "0",
@@ -355,6 +995,10 @@ def download_source_audio(url: str, output_path: Path, source_url: str = "") -> 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
+        # yt-dlp failed — try direct TikTok download as fallback
+        if "tiktok.com" in url.lower():
+            print("yt-dlp failed, trying direct TikTok download...")
+            return download_tiktok_slideshow_audio(url, output_path, source_url or url)
         print(f"Error downloading: {result.stderr}")
         return False
 
@@ -372,6 +1016,7 @@ async def identify_with_shazam(audio_path: Path) -> dict | None:
 
         if result and "track" in result:
             track = result["track"]
+            # Get offset from first match
             offset = None
             if result.get("matches") and len(result["matches"]) > 0:
                 offset = result["matches"][0].get("offset")
@@ -383,6 +1028,82 @@ async def identify_with_shazam(audio_path: Path) -> dict | None:
             }
     except Exception as e:
         print(f"Shazam error: {e}")
+
+    return None
+
+
+def identify_with_acrcloud(audio_path: Path) -> dict | None:
+    """Use ACRCloud for music identification (best for noisy content)."""
+    import hashlib
+    import hmac
+    import base64
+    import json
+    import time
+    import urllib.request
+
+    access_key = os.environ.get("ACRCLOUD_ACCESS_KEY", "")
+    access_secret = os.environ.get("ACRCLOUD_ACCESS_SECRET", "")
+    host = os.environ.get("ACRCLOUD_HOST", "identify-us-west-2.acrcloud.com")
+
+    if not access_key or not access_secret:
+        return None
+
+    try:
+        with open(audio_path, "rb") as f:
+            sample = f.read()
+
+        # Build HMAC signature
+        timestamp = str(int(time.time()))
+        string_to_sign = f"POST\n/v1/identify\n{access_key}\naudio\n1\n{timestamp}"
+        sign = base64.b64encode(
+            hmac.new(access_secret.encode(), string_to_sign.encode(), hashlib.sha1).digest()
+        ).decode()
+
+        # Build multipart form data
+        boundary = f"----SongGrab{int(time.time())}"
+        body = b""
+        for key, value in [
+            ("access_key", access_key),
+            ("data_type", "audio"),
+            ("signature_version", "1"),
+            ("signature", sign),
+            ("sample_bytes", str(len(sample))),
+            ("timestamp", timestamp),
+        ]:
+            body += f"--{boundary}\r\n".encode()
+            body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
+            body += f"{value}\r\n".encode()
+
+        body += f"--{boundary}\r\n".encode()
+        body += b'Content-Disposition: form-data; name="sample"; filename="sample.mp3"\r\n'
+        body += b"Content-Type: application/octet-stream\r\n\r\n"
+        body += sample
+        body += f"\r\n--{boundary}--\r\n".encode()
+
+        req = urllib.request.Request(
+            f"https://{host}/v1/identify",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        if result.get("status", {}).get("code") == 0:
+            music = result["metadata"]["music"][0]
+            title = music.get("title", "Unknown")
+            artists = music.get("artists", [{}])
+            artist = artists[0].get("name", "Unknown Artist") if artists else "Unknown Artist"
+            return {
+                "title": title,
+                "artist": artist,
+                "full_title": f"{artist} - {title}",
+                "offset": None,
+                "score": music.get("score", 0),
+            }
+    except Exception as e:
+        print(f"ACRCloud error: {e}")
 
     return None
 
@@ -402,6 +1123,9 @@ def identify_with_audd(audio_path: Path) -> dict | None:
             "audio": audio_data,
             "return": "spotify",
         }
+        api_token = os.environ.get("AUDD_API_TOKEN")
+        if api_token:
+            data["api_token"] = api_token
 
         req = urllib.request.Request(
             "https://api.audd.io/",
@@ -414,6 +1138,7 @@ def identify_with_audd(audio_path: Path) -> dict | None:
 
         if result.get("status") == "success" and result.get("result"):
             track = result["result"]
+            # Parse timecode (format "MM:SS") to seconds
             offset = None
             timecode = track.get("timecode")
             if timecode:
@@ -440,62 +1165,612 @@ def identify_with_audd(audio_path: Path) -> dict | None:
     return None
 
 
-async def identify_song(audio_path: Path, duration_seconds: int = 10) -> dict | None:
-    """Identify song using Shazam, with AudD as fallback."""
-    import urllib.parse
-
-    print("Identifying song with Shazam...")
-    result = await identify_with_shazam(audio_path)
-
-    if result:
-        return result
-
-    print("Shazam couldn't identify. Trying AudD as fallback...")
-    return identify_with_audd(audio_path)
-
-
-def search_youtube(artist: str, title: str) -> str | None:
-    """Search YouTube for the song and return the best match URL."""
-    print(f"Searching YouTube for: {artist} - {title}...")
-
-    # Clean up artist/title for better search results
-    # Replace & with 'and' as it causes search issues
-    clean_artist = artist.replace("&", "and")
-    clean_title = title.replace("&", "and")
-
-    search_queries = [
-        # Quoted exact match attempts first
-        f'"{clean_title}" "{clean_artist}"',
-        f'"{clean_title}" {clean_artist}',
-        # Then standard searches
-        f"{clean_title} {clean_artist}",
-        f"{clean_artist} {clean_title}",
-        f"{clean_artist} {clean_title} official audio",
-        f"{clean_artist} {clean_title} audio",
+def get_audio_duration(audio_path: Path) -> float:
+    """Get the duration of an audio file in seconds."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+        "-of", "csv=p=0", str(audio_path)
     ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return float(result.stdout.strip())
+    except (ValueError, AttributeError):
+        return 0.0
 
-    for query in search_queries:
-        cmd = [
-            "yt-dlp",
-            "--default-search", "ytsearch1",
-            "--get-url",
-            "--get-id",
-            "-f", "bestaudio",
-            "--no-playlist",
-            "--quiet",
-            query
-        ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+def extract_audio_segment(audio_path: Path, output_path: Path, start: float, duration: float = 15) -> bool:
+    """Extract a segment from an audio file."""
+    cmd = [
+        "ffmpeg", "-y", "-i", str(audio_path),
+        "-ss", str(start), "-t", str(duration),
+        "-q:a", "0", str(output_path)
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    return output_path.exists()
 
-        if result.returncode == 0 and result.stdout.strip():
-            lines = result.stdout.strip().split('\n')
-            for line in lines:
-                if len(line) == 11:
-                    return f"https://www.youtube.com/watch?v={line}"
-            return lines[0]
 
+def reduce_vocals(audio_path: Path, output_path: Path) -> bool:
+    """Reduce vocal frequencies to help song identification.
+
+    Applies a band-reject filter on typical vocal range (300-3000 Hz)
+    and boosts bass/treble where music is more prominent.
+    """
+    cmd = [
+        "ffmpeg", "-y", "-i", str(audio_path),
+        "-af", "bandreject=f=1000:width_type=h:w=1500,bass=g=3,treble=g=3",
+        "-q:a", "0", str(output_path)
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    return output_path.exists()
+
+
+def check_demucs() -> bool:
+    """Check if demucs CLI is installed and runnable."""
+    try:
+        result = subprocess.run(
+            ["demucs", "--help"], capture_output=True, timeout=10
+        )
+        return result.returncode == 0
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def separate_vocals_demucs(audio_path: Path, work_dir: Path) -> Path | None:
+    """Use Demucs to isolate the music (no-vocals) stem and return its path.
+
+    Slow (~10-60s depending on hardware) but cleanly removes voiceovers and SFX
+    that the bandreject filter can't touch. Used as a last-resort fallback when
+    normal identification fails.
+    """
+    if not check_demucs():
+        print("  Demucs not installed — install with: pip3 install demucs")
+        return None
+
+    print("Isolating music stem with Demucs (this may take 10-60s)...")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "demucs",
+        "--two-stems=vocals",
+        "--mp3",
+        "-o", str(work_dir),
+        str(audio_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        print(f"  Demucs failed: {err[:300]}")
+        return None
+
+    # Demucs writes to <work_dir>/<model_name>/<basename>/no_vocals.mp3
+    stem_name = audio_path.stem
+    for model_dir in work_dir.iterdir():
+        if not model_dir.is_dir():
+            continue
+        candidate = model_dir / stem_name / "no_vocals.mp3"
+        if candidate.exists():
+            return candidate
+    print("  Demucs output not found at expected path.")
     return None
+
+
+async def retry_identify_song(audio_path: Path, retry_count: int) -> dict | None:
+    """Identify song using different segments than the normal flow.
+
+    Normal flow tries: middle, 75%, beginning.
+    Retry tries: 25%, very end, 40%, plus speed-shifted versions.
+    """
+    total_duration = get_audio_duration(audio_path)
+    if total_duration < 8:
+        print(f"Audio too short for retry ({total_duration:.1f}s).")
+        return None
+
+    samples = []
+    temp_dir = audio_path.parent
+
+    if total_duration > 15:
+        if retry_count == 0:
+            # Retry 1: 25% mark and very end — different from normal middle/75%/beginning
+            early_start = max(0, total_duration * 0.25 - 6)
+            early_path = temp_dir / "retry_early.mp3"
+            if extract_audio_segment(audio_path, early_path, early_start, 12):
+                samples.append(("25% mark", early_path))
+
+            end_start = max(0, total_duration - 12)
+            end_path = temp_dir / "retry_end.mp3"
+            if extract_audio_segment(audio_path, end_path, end_start, 12):
+                samples.append(("very end", end_path))
+        elif retry_count == 1:
+            # Retry 2: 40% mark and 60% mark
+            mark40_start = max(0, total_duration * 0.4 - 6)
+            mark40_path = temp_dir / "retry_40.mp3"
+            if extract_audio_segment(audio_path, mark40_path, mark40_start, 12):
+                samples.append(("40% mark", mark40_path))
+
+            mark60_start = max(0, total_duration * 0.6 - 6)
+            mark60_path = temp_dir / "retry_60.mp3"
+            if extract_audio_segment(audio_path, mark60_path, mark60_start, 12):
+                samples.append(("60% mark", mark60_path))
+        else:
+            # Retry 3: speed-shifted full audio (catches sped up/slowed songs)
+            fast_path = temp_dir / "retry_fast.mp3"
+            cmd = ["ffmpeg", "-y", "-i", str(audio_path), "-af", "atempo=0.92", "-q:a", "0", str(fast_path)]
+            subprocess.run(cmd, capture_output=True)
+            if fast_path.exists():
+                samples.append(("slowed 8%", fast_path))
+
+            slow_path = temp_dir / "retry_slow.mp3"
+            cmd = ["ffmpeg", "-y", "-i", str(audio_path), "-af", "atempo=1.08", "-q:a", "0", str(slow_path)]
+            subprocess.run(cmd, capture_output=True)
+            if slow_path.exists():
+                samples.append(("sped 8%", slow_path))
+    else:
+        # Short audio — try speed-shifted versions
+        fast_path = temp_dir / "retry_fast.mp3"
+        cmd = ["ffmpeg", "-y", "-i", str(audio_path), "-af", "atempo=0.92", "-q:a", "0", str(fast_path)]
+        subprocess.run(cmd, capture_output=True)
+        if fast_path.exists():
+            samples.append(("slowed 8%", fast_path))
+
+        slow_path = temp_dir / "retry_slow.mp3"
+        cmd = ["ffmpeg", "-y", "-i", str(audio_path), "-af", "atempo=1.08", "-q:a", "0", str(slow_path)]
+        subprocess.run(cmd, capture_output=True)
+        if slow_path.exists():
+            samples.append(("sped 8%", slow_path))
+
+    if not samples:
+        print("Could not generate retry samples.")
+        return None
+
+    # Per-segment iteration. ACRCloud >= 70 short-circuits. Weak ACRCloud
+    # plus an AudD/Shazam alternative returns combined candidates.
+    weak_acrcloud: dict | None = None
+    audd_match: dict | None = None
+    shazam_match: dict | None = None
+    has_acrcloud = os.environ.get("ACRCLOUD_ACCESS_KEY")
+    for label, sample_path in samples:
+        print(f"  Trying {label}...")
+        if has_acrcloud:
+            result = identify_with_acrcloud(sample_path)
+            if result:
+                score = result.get("score", 0)
+                if score >= 70:
+                    result["service"] = "acrcloud"
+                    print(f"  ACRCloud matched on {label} (score {score})")
+                    return result
+                if weak_acrcloud is None or score > weak_acrcloud.get("score", 0):
+                    weak_acrcloud = result
+        if not audd_match:
+            result = identify_with_audd(sample_path)
+            if result:
+                audd_match = result
+                print(f"  AudD matched on {label}")
+        if not shazam_match:
+            result = await identify_with_shazam(sample_path)
+            if result:
+                shazam_match = result
+                print(f"  Shazam matched on {label}")
+
+    if weak_acrcloud:
+        weak_acrcloud["service"] = "acrcloud"
+    if audd_match:
+        audd_match["service"] = "audd"
+    if shazam_match:
+        shazam_match["service"] = "shazam"
+
+    if weak_acrcloud and (audd_match or shazam_match):
+        candidates: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for c in [weak_acrcloud, audd_match, shazam_match]:
+            if not c:
+                continue
+            key = (c["artist"].lower().strip(), c["title"].lower().strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(c)
+        primary = candidates[0]
+        if len(candidates) > 1:
+            primary["_alternates"] = candidates[1:]
+            print(f"  Services disagree on {len(candidates)} songs — will download each.")
+        return primary
+
+    if audd_match:
+        return audd_match
+    if shazam_match:
+        return shazam_match
+    if weak_acrcloud:
+        print(f"  Falling back to ACRCloud's weak match (score {weak_acrcloud.get('score')}).")
+        return weak_acrcloud
+    return None
+
+
+async def identify_song_candidates(
+    audio_path: Path,
+    start_offset: int | None = None,
+    source_label: str = "",
+    seen_keys: set | None = None,
+    min_acr_score: int = 50,
+) -> list[dict]:
+    """Run all 3 services across all segments. Keep ACRCloud matches with
+    score >= min_acr_score (default 50) plus every unique AudD/Shazam match.
+    Pass `seen_keys` to extend a dedupe set across multiple calls (e.g. raw
+    audio + demucs stem)."""
+    total_duration = get_audio_duration(audio_path)
+    samples = []
+    temp_dir = audio_path.parent
+
+    if start_offset is not None:
+        if total_duration > start_offset + 3:
+            offset_path = temp_dir / "cand_offset.mp3"
+            if extract_audio_segment(audio_path, offset_path, start_offset, 15):
+                samples.append((f"{start_offset}s mark", offset_path))
+            if total_duration > start_offset + 18:
+                offset2_path = temp_dir / "cand_offset2.mp3"
+                if extract_audio_segment(audio_path, offset2_path, start_offset + 15, 15):
+                    samples.append((f"{start_offset + 15}s mark", offset2_path))
+        if not samples:
+            samples.append(("full", audio_path))
+    elif total_duration > 20:
+        mid_start = max(0, (total_duration / 2) - 7.5)
+        mid_path = temp_dir / "cand_mid.mp3"
+        if extract_audio_segment(audio_path, mid_path, mid_start, 15):
+            samples.append(("middle", mid_path))
+        late_start = max(0, total_duration * 0.75 - 7.5)
+        late_path = temp_dir / "cand_late.mp3"
+        if extract_audio_segment(audio_path, late_path, late_start, 15):
+            samples.append(("late", late_path))
+        begin_path = temp_dir / "cand_begin.mp3"
+        if extract_audio_segment(audio_path, begin_path, 0, 15):
+            samples.append(("beginning", begin_path))
+    else:
+        samples.append(("full", audio_path))
+
+    candidates: list[dict] = []
+    if seen_keys is None:
+        seen_keys = set()
+
+    src_tag = f" {source_label}" if source_label else ""
+
+    def add(result: dict | None, service: str, label: str) -> bool:
+        if not result:
+            return False
+        key = (result["artist"].lower().strip(), result["title"].lower().strip())
+        score = result.get("score")
+        score_str = f" (score {score})" if score is not None else ""
+        if key in seen_keys:
+            print(f"  [{service}]{src_tag} [{label}] dup: {result['artist']} - {result['title']}{score_str}")
+            return False
+        seen_keys.add(key)
+        result["service"] = service
+        result["segment"] = label
+        if source_label:
+            result["source_label"] = source_label
+        candidates.append(result)
+        print(f"  [{service}]{src_tag} [{label}] {result['artist']} - {result['title']}{score_str}")
+        return True
+
+    has_acrcloud = os.environ.get("ACRCLOUD_ACCESS_KEY")
+    if has_acrcloud:
+        print(f"Querying ACRCloud across segments{src_tag}...")
+        for label, sample_path in samples:
+            result = identify_with_acrcloud(sample_path)
+            if not result:
+                continue
+            score = result.get("score", 0)
+            if score < min_acr_score:
+                print(f"  [acrcloud]{src_tag} [{label}] below threshold (score {score}): {result.get('artist')} - {result.get('title')}")
+                continue
+            add(result, "acrcloud", label)
+
+    print(f"Querying AudD across segments{src_tag}...")
+    for label, sample_path in samples:
+        add(identify_with_audd(sample_path), "audd", label)
+
+    print(f"Querying Shazam across segments{src_tag}...")
+    for label, sample_path in samples:
+        add(await identify_with_shazam(sample_path), "shazam", label)
+
+    return candidates
+
+
+def download_candidates_flat(
+    candidates: list[dict], source_url: str
+) -> tuple[int, Path]:
+    """For 2+ candidates: download each one as a FLAT mp3 in OUTPUT_DIR (plus a
+    YouTube top-result per unique title), recording each source URL in the links
+    ledger. Each candidate is saved in BOTH variants (instrumental + normal).
+    Preview them, keep the one you want, drag it into a category folder.
+    Returns (saved_count, OUTPUT_DIR)."""
+    # Recognition often picks the wrong artist on instrumentals (matches karaoke
+    # channels or title-coincident songs). Add a "title-only" pseudo-candidate
+    # per unique title so we also grab YouTube's top organic result for the bare
+    # title — what a human would search.
+    augmented: list[dict] = list(candidates)
+    seen_titles: set[str] = set()
+    for c in candidates:
+        title_key = c["title"].lower().strip()
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        augmented.append({
+            "artist": "",
+            "title": c["title"],
+            "service": "yt-title-search",
+            "segment": "",
+            "title_only": True,
+        })
+
+    saved = 0
+    for c in augmented:
+        artist = c["artist"]
+        title = c["title"]
+        service = c.get("service", "alt")
+        title_only = c.get("title_only", False)
+        display_name = title if title_only else f"{artist} - {title}"
+
+        used_ids: set = set()   # never let two variants land on the same video
+        for instrumental in DOWNLOAD_VARIANTS:
+            inst_suffix = " (instrumental)" if instrumental else ""
+            variant = "instrumental" if instrumental else "normal"
+            if title_only:
+                basename = sanitize_filename(f"{title}{inst_suffix} (yt-top-result)")
+            else:
+                basename = sanitize_filename(f"{title}{inst_suffix}")
+            flat_audio = OUTPUT_DIR / f"{basename}.mp3"
+
+            if flat_audio.exists():
+                print(f"  [{service}] already saved: {basename}")
+                saved += 1
+                continue
+
+            yt_url = search_youtube(artist, title, instrumental=instrumental,
+                                    exclude_ids=used_ids)
+            if not yt_url:
+                print(f"  [{service}] no YouTube result for {display_name} ({variant})")
+                continue
+            used_ids.add(_yt_video_id(yt_url))
+            if not download_youtube_mp3(yt_url, flat_audio, source_url):
+                print(f"  [{service}] YouTube download failed for {display_name} ({variant})")
+                continue
+
+            finalize_song(flat_audio, source_url, reindex=False)
+            print(f"  [{service}] saved: {basename}")
+            saved += 1
+
+    if saved:
+        reindex_all()
+    return saved, OUTPUT_DIR
+
+
+# --- YouTube result picking -------------------------------------------------
+# Taking YouTube's #1 hit is not good enough. A bare "<artist> <title>" search
+# returns the Official Music Video (extra intro/outro dialogue, wrong length),
+# and an "<artist> <title> instrumental" search returns a backing track. So each
+# variant asks for what it actually wants and then SCORES the top few results,
+# hard-rejecting anything that contradicts the variant.
+
+# Title words meaning "not the studio recording with vocals".
+_INSTRUMENTAL_MARKERS = (
+    "instrumental", "karaoke", "backing track", "no vocals", "without vocals",
+    "minus one", "acapella", "a cappella",
+)
+
+# Never a usable song file, whatever the reel played.
+_ALWAYS_JUNK = (
+    "reaction", "tutorial", "how to play", "guitar lesson", "8d audio",
+    "1 hour", "one hour", "10 hours", "1hour", "full album",
+)
+
+# Edits of a track. These are NOT junk by default — if the reel played the sped
+# up / slowed / remixed cut, that's the cut Sam wants, so a wanted variant is a
+# BONUS and its absence is a penalty. Only unwanted ones are junk. Keys are the
+# canonical name, values the spellings seen in YouTube titles.
+_VARIANT_FAMILIES = {
+    "sped up":   ("sped up", "sped-up", "spedup", "speed up", "speeded up"),
+    "slowed":    ("slowed", "slowed down", "slow down", "slowed reverb"),
+    "reverb":    ("reverb",),
+    "nightcore": ("nightcore",),
+    "remix":     ("remix", "rmx", "bootleg"),
+    "mashup":    ("mashup", "mash-up"),
+    "extended":  ("extended",),
+    "loop":      ("loop", "looped"),
+    "live":      ("live",),
+    "acoustic":  ("acoustic",),
+    "cover":     ("cover",),
+}
+
+# Set from --variant/--sped-up/--slowed/... to force a cut when recognition
+# reports the plain title but the reel actually played an edit.
+VARIANT_HINT: str = ""
+
+# Preferred shapes of the real recording, best first. "lyrics" is the key one —
+# it reliably lands on the plain audio rather than the music video.
+_VOCAL_BONUS = (("lyrics", 30), ("official audio", 28), ("(audio)", 24))
+
+_GOOD_ENOUGH = 45   # stop querying once a candidate scores this well
+
+
+def _yt_search(query: str, limit: int = 6) -> list[dict]:
+    """Return the top `limit` YouTube hits as dicts (id/duration/channel/title).
+    Uses --flat-playlist so this is one cheap call, not per-video extraction."""
+    cmd = [
+        "yt-dlp",
+        "--default-search", f"ytsearch{limit}",
+        "--flat-playlist",
+        "--no-warnings",
+        "--quiet",
+        "--print", "%(id)s\t%(duration)s\t%(channel)s\t%(title)s",
+        query,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+
+    hits = []
+    for line in result.stdout.strip().split("\n"):
+        parts = line.split("\t")
+        if len(parts) < 4 or len(parts[0]) != 11:
+            continue
+        try:
+            duration = float(parts[1])
+        except (ValueError, TypeError):
+            duration = None
+        hits.append({
+            "id": parts[0], "duration": duration,
+            "channel": parts[2], "title": parts[3],
+        })
+    return hits
+
+
+def _has_marker(text: str, phrase: str) -> bool:
+    """Whole-word match, so 'live' doesn't fire on 'alive'/'delivery' and
+    'cover' doesn't fire on 'discover'."""
+    return re.search(r"\b" + re.escape(phrase) + r"\b", text) is not None
+
+
+def _wanted_variants(title: str) -> set:
+    """Which edits of the track we're actually after — read off the recognised
+    title (recognition usually names the cut the reel played, e.g. 'lovely -
+    Sped Up Version'), plus any --variant override. Returns canonical names."""
+    hay = f"{title} {VARIANT_HINT}".lower()
+    return {canon for canon, spellings in _VARIANT_FAMILIES.items()
+            if any(_has_marker(hay, s) for s in spellings)}
+
+
+def _yt_queries(artist: str, title: str, instrumental: bool,
+                wanted: set | None = None) -> list[str]:
+    """The searches a human would actually type, in order of preference."""
+    t = title.replace("&", "and")
+    a = (artist or "").replace("&", "and").strip()
+
+    # If a wanted edit isn't already spelled out in the title (i.e. it came from
+    # --variant), add it to the query so YouTube surfaces that cut at all.
+    extra = " ".join(sorted(v for v in (wanted or set())
+                            if not _has_marker(t.lower(), v)))
+    if extra:
+        t = f"{t} {extra}"
+
+    if instrumental:
+        if a:
+            return [f"{a} {t} instrumental", f"{a} {t} official instrumental",
+                    f"{t} instrumental", f"{t} karaoke"]
+        return [f"{t} instrumental", f"{t} karaoke"]
+
+    # Vocals wanted: ask for the RECORDING, not the music video.
+    if a:
+        return [f"{a} {t} lyrics", f"{a} {t} official audio",
+                f"{a} {t} audio", f"{a} {t}"]
+    return [f"{t} lyrics", f"{t} official audio", t]
+
+
+def _score_yt_candidate(hit: dict, artist: str, title: str,
+                        instrumental: bool, exclude_ids: set,
+                        wanted: set | None = None) -> int:
+    name = hit["title"].lower()
+    channel = (hit.get("channel") or "").lower()
+    duration = hit.get("duration")
+    wanted = wanted or set()
+
+    if hit["id"] in exclude_ids:
+        return -10_000
+
+    has_instrumental = any(m in name for m in _INSTRUMENTAL_MARKERS)
+
+    if instrumental:
+        score = 60 if has_instrumental else -60
+        # A real instrumental beats someone's piano/guitar rendition.
+        if any(w in name for w in ("piano", "guitar", "violin", "cover")):
+            score -= 15
+    else:
+        # A vocals request must NEVER return a backing track. This is the bug
+        # that made "Title.mp3" byte-identical to "Title (instrumental).mp3".
+        if has_instrumental:
+            return -10_000
+        score = 0
+        for marker, bonus in _VOCAL_BONUS:
+            if marker in name:
+                score += bonus
+                break
+        if "music video" in name:
+            score -= 8   # music videos carry intro/outro dialogue
+
+    for junk in _ALWAYS_JUNK:
+        if _has_marker(name, junk):
+            score -= 45
+            break
+
+    # Edits: reward the cut the reel actually played, punish the ones it didn't.
+    # This is why "sped up"/"slowed"/"remix" are not blanket-junk — when the reel
+    # used the sped up version, that IS the song Sam wants.
+    for canon, spellings in _VARIANT_FAMILIES.items():
+        present = any(_has_marker(name, s) for s in spellings)
+        if canon in wanted:
+            score += 25 if present else -25
+        elif present:
+            score -= 45
+
+    if duration is not None:
+        if duration < 45 or duration > 900:
+            return -10_000   # clip, teaser, or an hour-long loop
+        if 120 <= duration <= 420:
+            score += 5
+
+    if artist and artist.strip():
+        a = artist.lower()
+        if a in name or a in channel:
+            score += 15
+    if title.lower() in name:
+        score += 10
+
+    return score
+
+
+def search_youtube(artist: str, title: str, instrumental: bool = False,
+                   exclude_ids: set | None = None) -> str | None:
+    """Search YouTube for the song and return the best match URL.
+
+    `instrumental` genuinely changes the search — instrumental asks for a
+    backing track, otherwise we ask for the recording WITH vocals and reject
+    any instrumental/karaoke hit outright. `exclude_ids` blocks video IDs
+    already used for another variant of the same song, so the two files can
+    never come back identical.
+
+    Edits (sped up / slowed / remix / live / ...) are honoured, not filtered:
+    whatever cut the recognised title names — or `--variant` forces — is the cut
+    we chase, because if the reel played the sped up version that IS the song.
+
+    If artist is empty, runs a title-only query — what a human would type when
+    recognition picked the wrong artist (common on instrumentals)."""
+    exclude_ids = exclude_ids or set()
+    wanted = _wanted_variants(title)
+    who = f"{artist} - {title}" if artist and artist.strip() else f"{title} (title-only)"
+    label = "instrumental" if instrumental else "with vocals"
+    if wanted:
+        label += ", " + "/".join(sorted(wanted))
+    print(f"Searching YouTube for: {who} [{label}]...")
+
+    best, best_score = None, -10_000
+    for query in _yt_queries(artist, title, instrumental, wanted):
+        for hit in _yt_search(query):
+            score = _score_yt_candidate(hit, artist, title, instrumental,
+                                        exclude_ids, wanted)
+            if score > best_score:
+                best, best_score = hit, score
+        if best_score >= _GOOD_ENOUGH:
+            break
+
+    if best is None or best_score <= -1000:
+        return None
+
+    print(f"  -> {best['title']}")
+    return f"https://www.youtube.com/watch?v={best['id']}"
+
+
+def _yt_video_id(url: str) -> str:
+    """Extract the 11-char video id from a watch URL."""
+    if "v=" in url:
+        return url.split("v=", 1)[1].split("&", 1)[0]
+    return url.rstrip("/").rsplit("/", 1)[-1]
 
 
 def download_youtube_mp3(youtube_url: str, output_path: Path, source_url: str = "") -> bool:
@@ -507,9 +1782,9 @@ def download_youtube_mp3(youtube_url: str, output_path: Path, source_url: str = 
 
     cmd = [
         "yt-dlp",
-        "-x",
+        "-x",  # Extract audio
         "--audio-format", "mp3",
-        "--audio-quality", "0",
+        "--audio-quality", "0",  # Best quality
         "-o", str(temp_output),
         "--no-playlist",
         "--quiet",
@@ -564,103 +1839,81 @@ def update_script():
         sys.exit(1)
 
 
-async def raw_download(url: str):
-    """Download raw audio from TikTok without any song identification."""
-    import urllib.request
-    from datetime import datetime
+def get_video_metadata(url: str) -> tuple[str | None, str | None]:
+    """Fetch the video's own title and id via yt-dlp, without downloading.
+    Either value may be None if yt-dlp can't read it. Returns (title, id)."""
+    cmd = [
+        "yt-dlp",
+        "--cookies-from-browser", "chrome",
+        "--no-playlist",
+        "--quiet",
+        "--skip-download",
+        "--print", "%(id)s\t%(title)s",
+        url,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        return None, None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None, None
+    # id first so a tab/newline inside the title can't break the split.
+    parts = result.stdout.strip().split("\t", 1)
+    vid = parts[0].strip() if parts and parts[0].strip() not in ("", "NA") else None
+    title = parts[1].strip() if len(parts) > 1 and parts[1].strip() not in ("", "NA") else None
+    return title, vid
 
+
+async def raw_download(url: str):
+    """Download the audio that's actually in a TikTok/Instagram video.
+
+    No song identification — this grabs the video's own audio track (the
+    voiceover plus whatever the creator mixed in), NOT the music track that
+    TikTok/Instagram attributes to the post. TikTok photo slideshows have no
+    video track, so for those it falls back to the attributed audio, which is
+    the only audio that exists."""
     check_dependencies()
     check_output_directory()
 
-    print("Downloading raw audio...")
-
-    # Try to get TikTok metadata for the audio URL and title
-    audio_url = None
-    suggested_name = None
-
-    if "tiktok.com" in url.lower():
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=30) as response:
-                html = response.read().decode("utf-8")
-
-            # Try to find playUrl
-            match = re.search(r'"playUrl":"([^"]+)"', html)
-            if match:
-                audio_url = match.group(1).encode().decode("unicode_escape")
-
-            # Try to get a title for the filename
-            title_match = re.search(r'"music":\{[^}]*"title":"([^"]+)"', html)
-            if title_match:
-                suggested_name = title_match.group(1)
-
-            # If it's "original sound", use the account name instead
-            if suggested_name and "original sound" in suggested_name.lower():
-                # Try to get username from URL
-                username_match = re.search(r'tiktok\.com/@([^/]+)', url)
-                if username_match:
-                    suggested_name = username_match.group(1)
-                else:
-                    # Try to get from page metadata
-                    author_match = re.search(r'"author":\{[^}]*"uniqueId":"([^"]+)"', html)
-                    if author_match:
-                        suggested_name = author_match.group(1)
-
-        except Exception as e:
-            print(f"Could not extract TikTok data: {e}")
-
-    if audio_url:
-        # Download directly from TikTok
+    # TikTok photo slideshows have no video track — the attributed music is
+    # the only audio there is, so fall back to it.
+    if "tiktok.com" in url.lower() and "/photo/" in url.lower():
+        print("Detected TikTok slideshow (no video track) — downloading its audio...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if suggested_name:
-            filename = sanitize_filename(f"{suggested_name}.mp3")
-        else:
-            filename = f"tiktok_audio_{timestamp}.mp3"
+        output_path = OUTPUT_DIR / f"tiktok_slideshow_{timestamp}.mp3"
+        if not download_tiktok_slideshow_audio(url, output_path, url):
+            print("Slideshow audio download failed.")
+            sys.exit(1)
+        output_path = finalize_song(output_path, url)
+        print(f"\nSaved: {output_path}")
+        print("Done!")
+        sys.exit(0)
 
-        output_path = OUTPUT_DIR / filename
+    print("Fetching video info...")
+    title, vid = get_video_metadata(url)
 
-        try:
-            req = urllib.request.Request(
-                audio_url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
-                    "Referer": "https://www.tiktok.com/"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=60) as response:
-                audio_data = response.read()
+    if title and vid:
+        basename = sanitize_filename(f"{title} [{vid}]")
+    elif title:
+        basename = sanitize_filename(title)
+    elif vid:
+        basename = f"raw_audio_{vid}"
+    else:
+        basename = "raw_audio_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            # Save and convert to mp3 with source URL metadata
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_audio = Path(temp_dir) / "temp_audio"
-                with open(temp_audio, "wb") as f:
-                    f.write(audio_data)
+    output_path = OUTPUT_DIR / f"{basename}.mp3"
 
-                cmd = ["ffmpeg", "-y", "-i", str(temp_audio), "-q:a", "0", "-metadata", f"comment={url}", str(output_path)]
-                subprocess.run(cmd, capture_output=True, check=True)
+    existing = already_downloaded(output_path)
+    if existing:
+        print(f"\nAlready downloaded: {existing}")
+        sys.exit(0)
 
-            set_finder_comment(output_path, url)
-            print(f"\nSaved: {output_path}")
-            print("Done!")
-            sys.exit(0)
-
-        except Exception as e:
-            print(f"Direct download failed: {e}")
-            print("Trying yt-dlp fallback...")
-
-    # Fallback to yt-dlp
+    print("Downloading the video's audio track...")
     with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        source_audio = temp_path / "source.mp3"
-
+        source_audio = Path(temp_dir) / "source.mp3"
         cmd = [
             "yt-dlp",
-            "--cookies-from-browser", "safari",
+            "--cookies-from-browser", "chrome",
             "-x",
             "--audio-format", "mp3",
             "--audio-quality", "0",
@@ -668,63 +1921,207 @@ async def raw_download(url: str):
             "--no-playlist",
             "--quiet",
             "--progress",
-            url
+            url,
         ]
-
         result = subprocess.run(cmd, capture_output=True, text=True)
 
-        if result.returncode != 0:
-            print(f"Error downloading: {result.stderr}")
+        if result.returncode != 0 or not source_audio.exists():
+            err = (result.stderr or "").strip()[:300]
+            print(f"Error downloading: {err}")
             sys.exit(1)
 
-        # Save with timestamp name and add source URL metadata
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"tiktok_audio_{timestamp}.mp3"
-        output_path = OUTPUT_DIR / filename
-
-        # Re-encode with ffmpeg to add metadata
-        ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(source_audio), "-q:a", "0", "-metadata", f"comment={url}", str(output_path)]
+        # Re-encode to embed the source URL in the comment metadata.
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", str(source_audio),
+            "-q:a", "0", "-metadata", f"comment={url}", str(output_path),
+        ]
         subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
 
-        set_finder_comment(output_path, url)
-        print(f"\nSaved: {output_path}")
-        print("Done!")
-        sys.exit(0)
+    output_path = finalize_song(output_path, url)
+    print(f"\nSaved: {output_path}")
+    print("Done!")
+    sys.exit(0)
 
 
 async def main():
+    # Every search-based download now grabs BOTH variants (instrumental + normal)
+    # per DOWNLOAD_VARIANTS. The legacy --instrumental / -i flags are accepted but
+    # no-ops (kept so old muscle-memory / scripts don't error).
+    sys.argv = [a for a in sys.argv if a not in ("--instrumental", "-i")]
+
+    # Which cut of the track to grab. Recognition usually names it already
+    # ("lovely - Sped Up Version"), and that's picked up automatically — these
+    # flags are the manual override for when it reports the plain title but the
+    # reel actually played an edit.
+    #   --variant "sped up"   or the shorthands --sped-up --slowed --nightcore
+    #                                           --remix --live --acoustic
+    global VARIANT_HINT
+    if "--variant" in sys.argv:
+        i = sys.argv.index("--variant")
+        if i + 1 < len(sys.argv):
+            VARIANT_HINT = sys.argv[i + 1]
+            del sys.argv[i:i + 2]
+        else:
+            del sys.argv[i]
+    for canon in list(_VARIANT_FAMILIES):
+        flag = "--" + canon.replace(" ", "-")
+        if flag in sys.argv:
+            VARIANT_HINT = f"{VARIANT_HINT} {canon}".strip()
+            sys.argv = [a for a in sys.argv if a != flag]
+    if VARIANT_HINT:
+        print(f"Variant requested: {VARIANT_HINT}")
+
+    # Handle --reindex — just rebuild every folder's _Song Links.rtf and exit.
+    # (reindex_all() self-heals moved local sources first.)
+    if "--reindex" in sys.argv:
+        reindex_all()
+        return
+
+    # Handle --relink — re-find moved local source videos and repair their
+    # shortcuts/links, without a full reindex prompt. (reindex rebuilds anyway.)
+    if "--relink" in sys.argv:
+        relink_ledger()
+        reindex_all()
+        return
+
+    # Handle --watch — run the background folder watcher (used by the launchd
+    # agent com.samgritton.song-sources). Keeps every folder's _Sources and
+    # _Song Links.rtf in sync as songs are moved/duplicated between folders.
+    # Runs until killed.
+    if "--watch" in sys.argv:
+        watch_loop()
+        return
+
+    # Handle --candidates / -c — run all 3 services and download each best match
+    candidates_mode = False
+    if "--candidates" in sys.argv or "-c" in sys.argv:
+        candidates_mode = True
+        sys.argv = [a for a in sys.argv if a not in ("--candidates", "-c")]
+
     # Handle --update flag
     if len(sys.argv) >= 2 and sys.argv[1] in ("--update", "-u", "update"):
         update_script()
 
-    # Handle --raw flag
-    if len(sys.argv) >= 3 and sys.argv[1] in ("--raw", "-r", "raw"):
-        await raw_download(sys.argv[2])
+    # Handle numeric start offset: "song 10 <url>" or "song 1:30 <url>" pinpoints
+    # the N-second mark of the video. Useful for videos with multiple songs.
+    start_offset = None
+    if len(sys.argv) >= 2 and re.match(r'^\d+(:\d+)?$', sys.argv[1]):
+        arg = sys.argv[1]
+        if ':' in arg:
+            m, s = arg.split(':')
+            start_offset = int(m) * 60 + int(s)
+        else:
+            start_offset = int(arg)
+        # Drop the offset arg so existing URL parsing still works
+        sys.argv.pop(1)
 
-    if len(sys.argv) < 2:
-        print("Usage: song-grab <instagram-reel-or-tiktok-url>")
-        print("       song-grab --raw <url>  (download raw audio, no identification)")
-        print("       song-grab --update  (update to latest version)")
-        print("Example: song-grab 'https://www.instagram.com/reel/ABC123/'")
-        print(f"\nSongs are saved to: {OUTPUT_DIR}")
+    # Handle --raw flag
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--raw", "-r", "raw"):
+        if len(sys.argv) >= 3:
+            raw_url = sys.argv[2]
+        else:
+            try:
+                raw_url = input("URL: ").strip()
+                if not raw_url:
+                    print("No URL provided.")
+                    sys.exit(1)
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(1)
+        await raw_download(raw_url)
+
+    # Handle --search flag (skip metadata, force Shazam/ACRCloud/AudD identification)
+    search_mode = False
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--search", "-s", "search"):
+        search_mode = True
+        if len(sys.argv) >= 3:
+            url = sys.argv[2]
+        else:
+            try:
+                url = input("URL: ").strip()
+                if not url:
+                    print("No URL provided.")
+                    sys.exit(1)
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(1)
+    elif len(sys.argv) < 2:
+        # Prompt for URL - allows pasting without quotes
+        try:
+            url = input("URL: ").strip()
+            if not url:
+                print("No URL provided.")
+                sys.exit(1)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(1)
+    else:
+        url = sys.argv[1]
+
+    # Local media file? Identify the song embedded in it (no URL/metadata steps).
+    local_file = resolve_local_path(url)
+    if local_file:
+        url = str(local_file)  # record the clean absolute path as provenance
+
+    # Validate URL
+    if not local_file and "drive.google.com" in url.lower() and "/folders/" in url.lower():
+        print("Error: That's a Google Drive folder link.")
+        print("Please share a link to a specific file instead (e.g. drive.google.com/file/d/...)")
         sys.exit(1)
 
-    url = sys.argv[1]
+    # Direct YouTube URL — skip identification, just download audio of the video.
+    is_youtube = not local_file and any(d in url.lower() for d in ("youtube.com/watch", "youtu.be/", "youtube.com/shorts/", "music.youtube.com"))
+    if is_youtube:
+        check_dependencies()
+        check_output_directory()
+        print("YouTube URL detected — downloading audio directly...")
+        title_cmd = ["yt-dlp", "--get-title", "--no-playlist", "--quiet", url]
+        title_result = subprocess.run(title_cmd, capture_output=True, text=True)
+        if title_result.returncode != 0 or not title_result.stdout.strip():
+            print(f"Could not fetch YouTube title: {title_result.stderr.strip()[:200]}")
+            sys.exit(1)
+        yt_title = title_result.stdout.strip()
+        # A direct YouTube URL is one specific video the user chose — there's no
+        # search here to pick an instrumental vs. normal cut, so save it plainly.
+        filename = sanitize_filename(f"{yt_title}.mp3")
+        output_path = OUTPUT_DIR / filename
+        existing = already_downloaded(output_path)
+        if existing:
+            print(f"\nSong already exists: {existing}")
+            sys.exit(0)
+        if not download_youtube_mp3(url, output_path, url):
+            print("YouTube download failed.")
+            sys.exit(1)
+        output_path = finalize_song(output_path, url)
+        print(f"\nSaved: {output_path}")
+        print("Done!")
+        sys.exit(0)
 
-    if not any(domain in url.lower() for domain in ["instagram.com", "tiktok.com"]):
-        print("Warning: URL doesn't appear to be from Instagram or TikTok.")
+    if local_file:
+        print(f"Local file detected — identifying the song in: {local_file.name}")
+    elif not any(domain in url.lower() for domain in ["instagram.com", "tiktok.com", "drive.google.com"]):
+        print("Warning: URL doesn't appear to be from Instagram, TikTok, or Google Drive.")
         print("Proceeding anyway...")
 
+    # Check prerequisites
     check_dependencies()
     check_output_directory()
 
+    # Create temp directory for intermediate files
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         source_audio = temp_path / "source.mp3"
 
         # Step 1: Try to get song info from page metadata (most accurate)
         song_info = None
-        if "tiktok.com" in url.lower():
+        if candidates_mode:
+            print("Candidates mode: skipping metadata, will run all 3 services and download each match...")
+        elif search_mode or start_offset is not None:
+            if start_offset is not None:
+                print(f"Targeting {start_offset}s mark; skipping metadata, will identify song from audio...")
+            else:
+                print("Search mode: skipping metadata, will identify song from audio...")
+        elif "tiktok.com" in url.lower():
             print("Checking TikTok for song metadata...")
             song_info = extract_tiktok_music_metadata(url)
             if song_info:
@@ -735,68 +2132,141 @@ async def main():
             if song_info:
                 print(f"Found song in Instagram metadata: {song_info['artist']} - {song_info['title']}")
 
-        # Step 2: Download audio from source
-        if not download_source_audio(url, source_audio):
-            print("Failed to download audio from source.")
+        # Step 2: Get the source audio — extract from a local file, else download.
+        if local_file:
+            got_audio = extract_local_audio(local_file, source_audio)
+        else:
+            got_audio = download_source_audio(url, source_audio)
+        if not got_audio:
+            print("Failed to get audio from source.")
             sys.exit(1)
 
-        # Step 3: If no TikTok metadata, identify song with Shazam/AudD
+        # If metadata gave us a song, skip the all-services identification and
+        # fall through to the single-download flow below.
         if not song_info:
-            song_info = await identify_song(source_audio)
+            # Step 3: Run all 3 services on the raw audio across all segments.
+            # Keeps every ACRCloud match >= 50, plus every unique AudD/Shazam match.
+            print("\nRunning all services on raw audio...")
+            seen_keys: set = set()
+            candidates = await identify_song_candidates(
+                source_audio, start_offset=start_offset, seen_keys=seen_keys
+            )
 
-        if not song_info:
-            print("\nCould not identify the song.")
-            print("Try Shazam on your phone, or the song might be too obscure.")
-            sys.exit(1)
+            # Always also run Demucs vocal isolation and re-run services on the
+            # instrumental stem — strips voiceovers / SFX that mask the music.
+            print("\nIsolating vocals with Demucs and re-running services on stem...")
+            stem_path = separate_vocals_demucs(source_audio, temp_path / "demucs_out")
+            if stem_path:
+                cleaned_audio = temp_path / "cleaned.mp3"
+                shutil.copy2(stem_path, cleaned_audio)
+                stem_candidates = await identify_song_candidates(
+                    cleaned_audio,
+                    start_offset=start_offset,
+                    source_label="(stem)",
+                    seen_keys=seen_keys,
+                )
+                candidates.extend(stem_candidates)
+
+            # Final fallback: speed-shifted retries on raw audio (catches songs
+            # played at non-standard tempo).
+            if not candidates:
+                print("\nNo matches yet. Trying speed-shifted retry segments...")
+                for retry_count in range(3):
+                    print(f"  Retry {retry_count + 1}/3")
+                    extra = await retry_identify_song(source_audio, retry_count)
+                    if extra:
+                        candidates.append(extra)
+                        break
+
+            if not candidates:
+                print("\nNo services could identify the song. Try Shazam on your phone.")
+                failed_path = save_failed_url(url)
+                print(f"Saved URL for later retry: {failed_path}")
+                sys.exit(1)
+
+            print(f"\nFound {len(candidates)} unique candidate(s):")
+            for c in candidates:
+                score_str = f" (score {c.get('score')})" if c.get('score') is not None else ""
+                src_str = f" {c.get('source_label', '')}".rstrip() if c.get('source_label') else ""
+                seg_str = f" [{c.get('segment')}]" if c.get('segment') else ""
+                print(f"  - [{c.get('service')}]{src_str}{seg_str} {c['artist']} - {c['title']}{score_str}")
+
+            # Multi-candidate path: parent folder named after first match,
+            # each candidate in its own subfolder with .mp3 + .txt sidecar.
+            if len(candidates) > 1:
+                print(f"\nDownloading {len(candidates)} candidates as flat files into Music...")
+                saved, dest = download_candidates_flat(candidates, url)
+                if saved == 0:
+                    print("\nAll candidate downloads failed.")
+                    sys.exit(1)
+                print(f"\nDone! {saved} candidate(s) saved (flat) into:\n  {dest}")
+                print("Preview them, keep the one you want, then drag it into a category folder.")
+                sys.exit(0)
+
+            # Single candidate — fall through to existing single-download path.
+            song_info = candidates[0]
 
         artist = song_info["artist"]
         title = song_info["title"]
         if song_info.get("source") != "tiktok_metadata":
             print(f"\nIdentified: {artist} - {title}")
 
-        if song_info.get("offset") is not None:
-            timestamp = format_timestamp(song_info["offset"])
-            filename = sanitize_filename(f"{title} {timestamp}.mp3")
-        else:
-            filename = sanitize_filename(f"{title}.mp3")
-        output_path = OUTPUT_DIR / filename
-
-        if output_path.exists():
-            print(f"\nSong already exists: {output_path}")
-            sys.exit(0)
-
-        # Step 4: Download the song
-        # Prefer TikTok direct audio (exact match) over YouTube search
-        downloaded = False
-
-        if song_info.get("tiktok_audio_url"):
-            print("Downloading audio directly from TikTok...")
-            downloaded = download_tiktok_direct_audio(song_info["tiktok_audio_url"], output_path, url)
-            if downloaded:
-                set_finder_comment(output_path, url)
-                print(f"\nSaved: {output_path}")
-                print("Done!")
+        # Step 4: Download BOTH variants — instrumental backing track and the
+        # normal with-vocals version — into OUTPUT_DIR.
+        saved_any = False
+        used_ids: set = set()   # never let two variants land on the same video
+        for instrumental in DOWNLOAD_VARIANTS:
+            variant = "instrumental" if instrumental else "normal"
+            inst_suffix = " (instrumental)" if instrumental else ""
+            if song_info.get("offset") is not None:
+                timestamp = format_timestamp(song_info["offset"])
+                filename = sanitize_filename(f"{title}{inst_suffix} {timestamp}.mp3")
             else:
-                print("Direct TikTok download failed, trying YouTube...")
+                filename = sanitize_filename(f"{title}{inst_suffix}.mp3")
+            output_path = OUTPUT_DIR / filename
 
-        # Fall back to YouTube if no TikTok audio or download failed
-        if not downloaded:
-            youtube_url = search_youtube(artist, title)
+            existing = already_downloaded(output_path)
+            if existing:
+                print(f"\n{variant.capitalize()} version already exists: {existing.name}")
+                saved_any = True
+                continue
 
-            if not youtube_url:
-                print(f"\nCould not find '{artist} - {title}' on YouTube.")
-                print("Try searching manually.")
-                sys.exit(1)
+            # Prefer TikTok direct audio (exact match) for the NORMAL version —
+            # the source clip carries the real vocals. The instrumental always
+            # comes from a YouTube "instrumental" search instead.
+            downloaded = False
+            if not instrumental and song_info.get("tiktok_audio_url"):
+                print(f"\nDownloading {variant} version directly from TikTok...")
+                downloaded = download_tiktok_direct_audio(song_info["tiktok_audio_url"], output_path, url)
+                if downloaded:
+                    finalize_song(output_path, url, reindex=False)
+                    print(f"Saved: {output_path.name}")
+                else:
+                    print("Direct TikTok download failed, trying YouTube...")
 
-            print(f"Found on YouTube: {youtube_url}")
+            # Fall back to YouTube if no TikTok audio or download failed.
+            if not downloaded:
+                youtube_url = search_youtube(artist, title, instrumental=instrumental,
+                                             exclude_ids=used_ids)
+                if not youtube_url:
+                    print(f"\nCould not find '{artist} - {title}' ({variant}) on YouTube.")
+                    continue
+                used_ids.add(_yt_video_id(youtube_url))
+                print(f"\nFound on YouTube ({variant}): {youtube_url}")
+                if not download_youtube_mp3(youtube_url, output_path, url):
+                    print(f"Failed to download {variant} version from YouTube.")
+                    continue
+                finalize_song(output_path, url, reindex=False)
+                print(f"Saved: {output_path.name}")
 
-            if not download_youtube_mp3(youtube_url, output_path, url):
-                print("Failed to download from YouTube.")
-                sys.exit(1)
+            saved_any = True
 
-            set_finder_comment(output_path, url)
-            print(f"\nSaved: {output_path}")
-            print("Done!")
+        if not saved_any:
+            print("\nCould not download either version. Try searching manually.")
+            sys.exit(1)
+
+        reindex_all()
+        print("\nDone!")
 
 
 if __name__ == "__main__":

@@ -40,7 +40,24 @@ or
 song-grab "https://www.instagram.com/reel/ABC123/"
 ```
 
-Songs are saved to your Music folder (in a SongGrab subfolder).
+Songs are saved to your Music folder (in a SongGrab subfolder). To change that,
+put the folder path in `~/.config/song-grab/config`.
+
+Each run saves **two files**: the real recording (`Title.mp3`) and the backing
+track (`Title (instrumental).mp3`).
+
+### Sped up / slowed / remix versions
+
+If the reel played an edit of the track, that's what you get — the picker reads
+the cut off the identified title and chases it. To force one when the song is
+identified by its plain name:
+
+```
+song-grab --sped-up "<url>"
+song-grab --variant "slowed reverb" "<url>"
+```
+
+Shorthands: `--sped-up --slowed --nightcore --remix --live --acoustic --extended`.
 
 ## Update
 
