@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime
+from html import unescape as _html_unescape
 from pathlib import Path
 
 # --- TLS CA bundle ---------------------------------------------------------
@@ -652,6 +653,29 @@ def check_output_directory():
         sys.exit(1)
 
 
+def _decode_meta_text(raw: str) -> str:
+    """Turn a string scraped out of a page's embedded JSON into real text.
+
+    There are TWO layers of escaping on these values and the old
+    `.encode().decode("unicode_escape")` got both wrong: it is latin-1 based, so
+    any literal non-ASCII came back mojibaked (an accented artist name lost its
+    accent to a two-character smear), and it left HTML entities completely
+    alone. The entities are what broke the YouTube search on 2026-08-01 - a song
+    name carrying &quot; survived into the query, where _yt_queries' "&" -> "and"
+    rewrite turned it into "andquot;" and the search became word salad.
+    json.loads handles \\uXXXX and \\/ correctly; the fallback covers values that
+    aren't valid JSON string bodies.
+    """
+    if not raw:
+        return raw
+    try:
+        text = json.loads(f'"{raw}"')
+    except (ValueError, TypeError):
+        text = raw
+    text = _html_unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def extract_tiktok_music_metadata(url: str) -> dict | None:
     """Extract song metadata and audio URL directly from TikTok page."""
     import urllib.request
@@ -674,10 +698,10 @@ def extract_tiktok_music_metadata(url: str) -> dict | None:
         if not match:
             return None
 
-        # Parse the JSON-like content
+        # Parse the JSON-like content. Escapes are undone per-value by
+        # _decode_meta_text, NOT over the whole blob - decoding the blob first
+        # mangles non-ASCII and never touches HTML entities.
         music_json = "{" + match.group(1) + "}"
-        # Handle escaped unicode
-        music_json = music_json.encode().decode("unicode_escape")
 
         # Extract title, author, and playUrl
         title_match = re.search(r'"title":"([^"]+)"', music_json)
@@ -685,9 +709,9 @@ def extract_tiktok_music_metadata(url: str) -> dict | None:
         play_url_match = re.search(r'"playUrl":"([^"]+)"', music_json)
 
         if title_match:
-            title = title_match.group(1)
-            artist = author_match.group(1) if author_match else "Unknown Artist"
-            play_url = play_url_match.group(1) if play_url_match else None
+            title = _decode_meta_text(title_match.group(1))
+            artist = _decode_meta_text(author_match.group(1)) if author_match else "Unknown Artist"
+            play_url = _decode_meta_text(play_url_match.group(1)) if play_url_match else None
 
             # Skip original sound entries (language-independent boolean check)
             original_match = re.search(r'"original"\s*:\s*(true|false)', music_json)
@@ -793,8 +817,8 @@ def _extract_instagram_music_from_embed(url: str) -> dict | None:
             html
         )
         if json_match:
-            artist = json_match.group(1).encode().decode("unicode_escape")
-            title = json_match.group(2).encode().decode("unicode_escape")
+            artist = _decode_meta_text(json_match.group(1))
+            title = _decode_meta_text(json_match.group(2))
             uses_original = json_match.group(3) == "true"
 
             if uses_original:
@@ -815,7 +839,7 @@ def _extract_instagram_music_from_embed(url: str) -> dict | None:
         if not match:
             return None
 
-        music_text = match.group(1).strip()
+        music_text = _decode_meta_text(match.group(1))
 
         if ' · ' not in music_text:
             return None
@@ -899,7 +923,7 @@ def download_tiktok_slideshow_audio(url: str, output_path: Path, source_url: str
             return False
 
         # Decode the URL (handles \u002F escape sequences)
-        audio_url = match.group(1).encode().decode("unicode_escape")
+        audio_url = _decode_meta_text(match.group(1))
 
         # Download the audio file
         audio_req = urllib.request.Request(
@@ -1589,6 +1613,80 @@ _VOCAL_BONUS = (("lyrics", 30), ("official audio", 28), ("(audio)", 24))
 
 _GOOD_ENOUGH = 45   # stop querying once a candidate scores this well
 
+# ...but the right KIND of video is not the right SONG. Everything scored below
+# judges only the SHAPE of a result (instrumental vs vocals, wanted edit, sane
+# duration) and treats an artist/title match as a mere bonus - so when a search
+# returns nothing relevant at all, the best-SHAPED piece of junk still wins and
+# gets downloaded. That is how a query mangled by an HTML entity on 2026-08-01
+# landed on "[FREE] Dancehall Beat Riddim Instrumental 2020": +60 for saying
+# "instrumental", +5 for a sane duration = 65, straight past _GOOD_ENOUGH.
+# _relevance is the gate - no demonstrable link to the track, no download.
+_MIN_RELEVANCE = 0.6                 # share of the title's content words needed
+_MIN_RELEVANCE_WITH_ARTIST = 0.34    # ...relaxed when the artist matches too
+
+# Words too common to prove anything about WHICH track a result is.
+_TITLE_NOISE = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "i", "in",
+    "is", "it", "its", "me", "my", "of", "on", "or", "so", "that", "the",
+    "this", "to", "was", "we", "what", "when", "who", "with", "you", "your",
+    "official", "video", "audio", "lyric", "lyrics", "music", "song", "version",
+    "feat", "ft", "prod", "hd", "hq", "full", "motion", "picture", "soundtrack",
+    "theme", "original", "explicit", "remastered",
+}
+
+
+def _norm_text(s: str) -> str:
+    """Lowercase with punctuation flattened, so 'Made For?' == '(made for)'."""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]+", " ", (s or "").lower())).strip()
+
+
+def _content_words(s: str) -> set:
+    """The words that actually identify a track. Falls back to every word when
+    a title is nothing but noise words (e.g. "You")."""
+    words = _norm_text(s).split()
+    return {w for w in words if w not in _TITLE_NOISE} or set(words)
+
+
+def _title_forms(title: str) -> list[str]:
+    """Forms of the recognised title worth matching: the whole thing, the same
+    minus parentheticals ("(From The Motion Picture ...)"), and the part before
+    a trailing " - Slowed"-style edit suffix. Relevance takes the MAX over all
+    three, so trimming can only ever rescue a real match, never cause a reject."""
+    stripped = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", title or "")
+    forms, seen = [], set()
+    for raw in (title or "", stripped, stripped.split(" - ")[0]):
+        n = _norm_text(raw)
+        if len(n) >= 2 and n not in seen:
+            seen.add(n)
+            forms.append(n)
+    return forms
+
+
+def _artist_matches(hit: dict, artist: str) -> bool:
+    a = _norm_text(artist)
+    if not a:
+        return False
+    hay = f"{_norm_text(hit.get('title'))} {_norm_text(hit.get('channel'))}"
+    # Squashed compare so a "BillieEilishVEVO" channel still counts.
+    return a in hay or a.replace(" ", "") in hay.replace(" ", "")
+
+
+def _relevance(hit: dict, artist: str, title: str) -> float:
+    """0..1 - does this result plausibly BE the track we asked for?"""
+    name = _norm_text(hit.get("title"))
+    if not name:
+        return 0.0
+    name_words = set(name.split())
+
+    best = 0.0
+    for form in _title_forms(title):
+        if form in name:
+            return 1.0                       # title present verbatim
+        want = _content_words(form)
+        if want:
+            best = max(best, len(want & name_words) / len(want))
+    return best
+
 
 def _yt_search(query: str, limit: int = 6) -> list[dict]:
     """Return the top `limit` YouTube hits as dicts (id/duration/channel/title).
@@ -1672,6 +1770,11 @@ def _score_yt_candidate(hit: dict, artist: str, title: str,
     wanted = wanted or set()
 
     if hit["id"] in exclude_ids:
+        return -10_000
+
+    # Is this even the right song? Everything below only judges the shape.
+    floor = _MIN_RELEVANCE_WITH_ARTIST if _artist_matches(hit, artist) else _MIN_RELEVANCE
+    if _relevance(hit, artist, title) < floor:
         return -10_000
 
     has_instrumental = any(m in name for m in _INSTRUMENTAL_MARKERS)
@@ -1760,6 +1863,9 @@ def search_youtube(artist: str, title: str, instrumental: bool = False,
             break
 
     if best is None or best_score <= -1000:
+        # Say so out loud. Downloading nothing beats silently downloading the
+        # best-shaped unrelated video, which is what used to happen here.
+        print(f"  -> nothing on YouTube matched \"{title}\" closely enough")
         return None
 
     print(f"  -> {best['title']}")
@@ -1780,19 +1886,35 @@ def download_youtube_mp3(youtube_url: str, output_path: Path, source_url: str = 
     # Download to a temp file first, then add metadata
     temp_output = output_path.parent / f"temp_{output_path.name}"
 
-    cmd = [
-        "yt-dlp",
-        "-x",  # Extract audio
-        "--audio-format", "mp3",
-        "--audio-quality", "0",  # Best quality
-        "-o", str(temp_output),
-        "--no-playlist",
-        "--quiet",
-        "--progress",
-        youtube_url
-    ]
+    # YouTube throws intermittent 403s at the default player client, and one
+    # 403 used to lose the whole variant (you'd get the vocals and silently no
+    # instrumental). Retry on the known-good client instead of giving up.
+    # "ios"/"web_safari" is NOT a fallback any more - it now wants a PO token
+    # and answers "Requested format is not available".
+    attempts = [None, "web_embedded"]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = None
+    for i, client in enumerate(attempts):
+        cmd = [
+            "yt-dlp",
+            "-x",  # Extract audio
+            "--audio-format", "mp3",
+            "--audio-quality", "0",  # Best quality
+            "-o", str(temp_output),
+            "--no-playlist",
+            "--quiet",
+            "--progress",
+        ]
+        if client:
+            cmd += ["--extractor-args", f"youtube:player_client={client}"]
+        cmd.append(youtube_url)
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0 and temp_output.exists():
+            break
+        temp_output.unlink(missing_ok=True)   # don't hand a half-file to ffmpeg
+        if i < len(attempts) - 1:
+            print("  YouTube refused that request, retrying on player_client=web_embedded...")
 
     if result.returncode != 0:
         print(f"Error downloading from YouTube: {result.stderr}")
