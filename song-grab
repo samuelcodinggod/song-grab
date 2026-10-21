@@ -12,6 +12,12 @@ Usage: song-grab              (prompts for URL - no quotes needed)
        song-grab --reindex    (rebuild every folder's "_Song Links.rtf")
        song-grab --relink     (re-find moved local source videos, then reindex)
        song-grab --watch      (background: auto-sync sources as songs are moved)
+       song-grab --backfill-tags  (give untagged songs an ID3 title; add --write)
+
+Already own the song? It is NOT downloaded again. The new reel URL is added on
+its own line in the existing file's Get Info comment, so Finder Cmd+G opens
+every reel that used that song at once. A different edit of a song (slowed,
+sped up, reverb ...) counts as its own version and still downloads separately.
 
 Downloads the audio, identifies the song via Shazam, finds it on YouTube,
 and saves the MP3 FLAT into ~/Main/Music. Each source URL is recorded in a
@@ -34,6 +40,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import unicodedata
 from datetime import datetime
 from html import unescape as _html_unescape
 from pathlib import Path
@@ -82,6 +90,16 @@ DOWNLOAD_VARIANTS = [True, False]  # True = instrumental, False = normal (vocals
 # subfolder. Every folder gets a clickable "_Song Links.rtf" (song name =
 # hyperlink to its source video), regenerated from the ledger by reindex_all().
 LEDGER_PATH = OUTPUT_DIR / ".song_links.tsv"
+
+# Reel -> song, the reverse of the ledger. Answers "have I already sourced the
+# music from this reel?" before a run spends Demucs, three fingerprint APIs and
+# a YouTube search on a question the library already answered.
+#
+# It has to be a cached index, not a live scan: most of Sam's songs keep their
+# Get Info comment in the folder's .DS_Store rather than the file's xattr, so
+# reading them live costs one osascript per file (~50s for the library). The
+# index is written as links are added, so the check itself is a dict lookup.
+REEL_INDEX_PATH = OUTPUT_DIR / ".reel_index.tsv"
 INDEX_NAME = "_Song Links.rtf"
 SOURCES_DIRNAME = "_Sources"   # per-folder folder of double-clickable source shortcuts
 AUDIO_EXTS = {".mp3", ".m4a", ".mp4"}
@@ -99,6 +117,13 @@ def ledger_load() -> dict:
 
 
 def ledger_set(filename: str, url: str) -> None:
+    if not url:
+        return
+    # A Finder comment can hold SEVERAL links now — one line per reel that
+    # played the same song. The ledger is a TSV, so only the first link (the
+    # original source) may reach it; a newline or a tab here would corrupt the
+    # file for every other song in it.
+    url = url.splitlines()[0].strip().replace("\t", " ") if url else ""
     if not url:
         return
     links = ledger_load()
@@ -327,29 +352,63 @@ _COPY_SUFFIX_RE = re.compile(r"^(.*?)(?: copy(?: \d+)?| \d+)$")
 _HEX_LINE_RE = re.compile(r"^[0-9A-Fa-f]{2}( [0-9A-Fa-f]{2})*$")
 
 
-def _decode_finder_comment(hexstr: str) -> str:
-    """Turn `xattr -px` hex into the source it holds (macOS stores the Finder
-    comment as a binary plist). Returns '' if it isn't a source."""
+def _comment_bytes(hexstr: str) -> bytes | None:
+    """The raw bytes behind an `xattr -px` hex dump, or None."""
     hexstr = hexstr.replace(" ", "").replace("\n", "").strip()
     if not hexstr:
-        return ""
+        return None
     try:
-        raw = bytes.fromhex(hexstr)
+        return bytes.fromhex(hexstr)
     except ValueError:
+        return None
+
+
+def _decode_finder_comment_text(hexstr: str) -> str:
+    """The WHOLE Finder comment as text (macOS stores it as a binary plist).
+
+    A comment may hold several lines — one source link per line. The first line
+    is the original source; every later line is another reel that played the
+    same song, added by append_finder_comment() instead of downloading the song
+    a second time. Returns '' when the comment isn't a plain string."""
+    raw = _comment_bytes(hexstr)
+    if raw is None:
         return ""
-    val = ""
     try:
         import plistlib
         obj = plistlib.loads(raw)
         if isinstance(obj, str):
-            val = obj
+            return obj.strip()
     except Exception:
-        val = ""
-    if not val:                                  # not a clean string plist — dig it out
-        txt = raw.decode("utf-8", "ignore")
-        m = re.search(r"(https?://\S+|file://\S+|/[^\x00]+\.(?:mp4|mov|m4v|mkv|webm))", txt)
-        val = m.group(1) if m else ""
-    val = (val or "").strip()
+        pass
+    return ""
+
+
+def _first_source_line(text: str) -> str:
+    """The FIRST source URL or path in a (possibly multi-line) comment.
+
+    That first line is the original source, and it is the one the ledger, the
+    _Song Links.rtf index and the _Sources shortcut all use — the editors get
+    one shortcut per song, pointing at the reel the song came from."""
+    for line in text.splitlines():
+        val = line.strip()
+        low = val.lower()
+        if low.startswith(("http://", "https://", "file://")) or val.startswith(("/", "~")):
+            return val
+    return ""
+
+
+def _decode_finder_comment(hexstr: str) -> str:
+    """The source held in a Finder comment — the first link when it holds
+    several. Returns '' if it isn't a source."""
+    val = _first_source_line(_decode_finder_comment_text(hexstr))
+    if val:
+        return val
+    raw = _comment_bytes(hexstr)                 # not a clean string plist — dig it out
+    if raw is None:
+        return ""
+    txt = raw.decode("utf-8", "ignore")
+    m = re.search(r"(https?://\S+|file://\S+|/[^\x00]+\.(?:mp4|mov|m4v|mkv|webm))", txt)
+    val = (m.group(1) if m else "").strip()
     low = val.lower()
     if low.startswith(("http://", "https://", "file://")) or val.startswith(("/", "~")):
         return val
@@ -370,6 +429,42 @@ def _finder_comment_source(path: Path) -> str:
     if out.returncode != 0:
         return ""
     return _decode_finder_comment(out.stdout)
+
+
+def _finder_comment_via_finder(path: Path) -> str:
+    """Ask Finder itself for the comment. SLOW (one osascript per file), so it
+    is only the fallback for _finder_comment_text().
+
+    macOS keeps a Get Info comment in TWO places: the file's own xattr, and the
+    parent folder's .DS_Store. Many of Sam's songs have the comment ONLY in
+    .DS_Store — `xattr` reads back empty while Get Info plainly shows a link.
+    Reading just the xattr made this script believe those files had no links,
+    and a write then replaced a comment it had never seen. Finder reads both."""
+    try:
+        out = subprocess.run(["osascript", "-e", _AS_GET_COMMENT, str(path)],
+                             capture_output=True, text=True, timeout=20)
+    except Exception:
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _finder_comment_text(path: Path) -> str:
+    """The WHOLE Get Info comment of one file, every line of it. Used by
+    append_finder_comment(), which adds a link without losing the ones already
+    there. _finder_comment_source() reads the same comment but returns only the
+    first link.
+
+    Falls back to Finder when the xattr is empty — see
+    _finder_comment_via_finder() for why that is not optional."""
+    text = ""
+    try:
+        out = subprocess.run(["xattr", "-px", _FINDER_COMMENT_XATTR, str(path)],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0:
+            text = _decode_finder_comment_text(out.stdout)
+    except Exception:
+        text = ""
+    return text if text.strip() else _finder_comment_via_finder(path)
 
 
 def _finder_comments_batch(paths: list) -> dict:
@@ -503,11 +598,14 @@ def reindex_all() -> None:
 
 def _audio_layout_signature() -> frozenset:
     """Snapshot of where every song lives AND what source each one claims — the
-    set of (audio path, Finder comment) pairs under the Music tree, skipping
+    set of (audio path, first comment link) pairs under the Music tree, skipping
     dotfiles and the generated _Sources folders (so our own rebuilds never look
     like a change). Comparing two snapshots tells the watcher a song was moved,
     copied or renamed — and, because the comment is in the pair, that a source
     was edited by hand in Get Info, which must repoint its _Sources shortcut.
+    Only the FIRST link counts here, because only the first link feeds the
+    shortcut. Adding a second reel link to a song therefore starts no rebuild,
+    which is right — nothing the editors receive has changed.
     The comments come from one batched xattr call, so the poll stays cheap."""
     paths = _all_audio_paths()
     comments = _finder_comments_batch(paths)
@@ -569,24 +667,120 @@ def format_timestamp(seconds: float) -> str:
     return f"{minutes}.{secs:02d}"
 
 
+def _applescript_string(s: str) -> str:
+    """An AppleScript string literal for `s`.
+
+    A raw newline inside an AppleScript literal is a syntax error, so each line
+    break becomes a `linefeed` join instead. This is what lets a Get Info
+    comment hold one link per line."""
+    parts = [p.replace('\\', '\\\\').replace('"', '\\"')
+             for p in s.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    return " & linefeed & ".join(f'"{p}"' for p in parts)
+
+
+# The path and the comment go in as ARGUMENTS, never inside the script text.
+# osascript mis-decodes a non-ASCII byte in an -e script and answers
+# `syntax error: Expected """ but found unknown token`, so a song named
+# "vácuo.mp3" could not have its comment read OR written. Through argv the same
+# path works. Keep it this way.
+_AS_GET_COMMENT = ('on run argv\n'
+                   '  tell application "Finder" to return comment of '
+                   '(POSIX file (item 1 of argv) as alias)\n'
+                   'end run')
+_AS_SET_COMMENT = ('on run argv\n'
+                   '  tell application "Finder" to set comment of '
+                   '(POSIX file (item 1 of argv) as alias) to (item 2 of argv)\n'
+                   'end run')
+
+
 def set_finder_comment(file_path: Path, comment: str) -> bool:
-    """Set the Finder comment (visible in Get Info) for a file."""
+    """Set the Finder comment (visible in Get Info) for a file. The comment may
+    hold several lines."""
     try:
-        # Use AppleScript to set Finder comment - more reliable than xattr
-        escaped_path = str(file_path).replace('"', '\\"')
-        escaped_comment = comment.replace('\\', '\\\\').replace('"', '\\"')
-        script = f'tell application "Finder" to set comment of (POSIX file "{escaped_path}" as alias) to "{escaped_comment}"'
-        subprocess.run(["osascript", "-e", script], capture_output=True, check=True)
-        return True
-    except Exception as e:
+        out = subprocess.run(["osascript", "-e", _AS_SET_COMMENT,
+                              str(file_path), comment],
+                             capture_output=True, text=True, timeout=30)
+        return out.returncode == 0
+    except Exception:
         # Non-fatal - the ID3 comment is still saved
         return False
+
+
+def _is_source_line(line: str) -> str:
+    """True for a line of a Get Info comment that names WHERE the song came
+    from. Not every source is a web link — a song lifted out of a local edit
+    video is stored as an absolute path, and the ledger holds those too. Reading
+    only `http...` lines made the sync treat a path as a loose note, so it
+    appended the path again on every run."""
+    line = (line or "").strip()
+    return bool(line) and (line.startswith("/") or bool(re.match(r"https?://", line)))
+
+
+def _same_post(url: str) -> str:
+    """One key for the several URLs that name the SAME post, so the same reel
+    never lands in a Get Info comment twice. Instagram serves a reel as both
+    /p/<code>/ and /reels/<code>/, and both carry tracking query strings, so a
+    raw string compare called them two different reels."""
+    raw = (url or "").strip()
+    # YouTube comes first. Its video id sits in the QUERY string on a watch
+    # link (?v=...), so it has to come out BEFORE the query is dropped below.
+    # Without this every watch URL collapsed to the same key,
+    # "https://www.youtube.com/watch", and the reel index answered "already
+    # sourced" for a song it had never seen. Ids are case-sensitive, so this
+    # key is not lowercased.
+    if "youtube.com" in raw.lower():
+        m = re.search(r"[?&]v=([A-Za-z0-9_-]{6,})", raw)
+        if m:
+            return f"yt:{m.group(1)}"
+    m = re.search(r"(?:youtu\.be|youtube\.com/(?:shorts|embed|live|v))/([A-Za-z0-9_-]{6,})", raw)
+    if m:
+        return f"yt:{m.group(1)}"
+    u = raw.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    m = re.search(r"(?:instagram\.com)/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", u)
+    if m:
+        return f"ig:{m.group(1)}"
+    m = re.search(r"(?:tiktok\.com)/.*?/video/(\d+)", u)
+    if m:
+        return f"tt:{m.group(1)}"
+    return u.lower()
+
+
+def append_finder_comment(file_path: Path, url: str) -> tuple:
+    """Add `url` on a new line of the file's Get Info comment, under the links
+    already there. Returns (added, total_links).
+
+    This runs when a reel plays a song the library already holds: instead of
+    downloading the song again, the new reel URL joins the first one. Finder
+    Cmd+G then opens every link at once, so Sam can see how other people used
+    the same song. A URL already in the comment is not added twice."""
+    url = (url or "").strip()
+    if not url:
+        return (False, 0)
+    lines = [l.strip() for l in _finder_comment_text(file_path).splitlines() if l.strip()]
+    if not lines:
+        # Most songs predate comment stamping and hold only an empty comment,
+        # while the ledger still knows where they came from. Seed that original
+        # link first, or Cmd+G would open the new reel and lose the first one.
+        seed = _resolve_source(file_path, ledger_load())
+        if seed:
+            lines = [seed]
+    if _same_post(url) in {_same_post(l) for l in lines}:
+        return (False, len(lines))
+    lines.append(url)
+    if not set_finder_comment(file_path, "\n".join(lines)):
+        return (False, len(lines) - 1)
+    reel_index_add(url, file_path.name)
+    return (True, len(lines))
 
 
 def already_downloaded(output_path: Path) -> Path | None:
     """Return the existing path if the song was already downloaded — either
     at the original location, or wrapped into a folder by finalize_song().
-    Returns None if not found."""
+    Returns None if not found.
+
+    This is an EXACT-FILENAME check in the Music root only. Use it for the raw
+    download path. For "do we already own this song", use find_existing_song(),
+    which searches the whole tree and survives a rename."""
     if output_path.exists():
         return output_path
     wrapped = output_path.parent / output_path.stem / output_path.name
@@ -595,15 +789,489 @@ def already_downloaded(output_path: Path) -> Path | None:
     return None
 
 
-def finalize_song(audio_path: Path, source_url: str, reindex: bool = True) -> Path:
+# --- ID3 tags: the song identity that survives a rename ---------------------
+# The filename used to be the only record of which song a file held, so renaming
+# a file made the library forget it and the song downloaded again. Every new
+# download now also stamps the title and artist into the MP3's own ID3 tags,
+# which ride INSIDE the file through a rename, a copy and a move.
+
+def write_tags(audio_path: Path, title: str = "", artist: str = "") -> bool:
+    """Stamp title/artist into an MP3's ID3 tags. mutagen edits the tag in
+    place, so the file's Finder comment (an xattr) is untouched."""
+    if audio_path.suffix.lower() != ".mp3" or not (title or artist):
+        return False
+    try:
+        from mutagen.easyid3 import EasyID3
+        from mutagen.id3 import ID3NoHeaderError
+        from mutagen.mp3 import MP3
+    except Exception:
+        return False                      # mutagen absent — fall back to filenames
+    try:
+        try:
+            tags = EasyID3(str(audio_path))
+        except ID3NoHeaderError:
+            handle = MP3(str(audio_path))
+            handle.add_tags()
+            handle.save()
+            tags = EasyID3(str(audio_path))
+        if title:
+            tags["title"] = title
+        if artist:
+            tags["artist"] = artist
+        tags.save()
+        return True
+    except Exception:
+        return False
+
+
+def read_tags(audio_path: Path) -> dict:
+    """{'title': ..., 'artist': ...} from a song's own tags — {} if it has
+    none (every file saved before tagging was added)."""
+    try:
+        from mutagen import File as MutagenFile
+        handle = MutagenFile(str(audio_path), easy=True)
+        if not handle or not handle.tags:
+            return {}
+        out = {}
+        for key in ("title", "artist"):
+            val = handle.tags.get(key)
+            if val:
+                out[key] = str(val[0]).strip()
+        return out
+    except Exception:
+        return {}
+
+
+# --- "Do we already have this song?" ---------------------------------------
+# The old check compared one exact filename in the Music ROOT, so a song already
+# filed into a category folder was invisible and downloaded a second time. The
+# check now walks the whole tree and compares a normalised identity:
+#     title + artist + instrumental-or-not + the set of edit variants.
+# The variant set is part of the identity on purpose. A "slowed + reverb" cut is
+# a DIFFERENT version of the song, so it still downloads as its own file with
+# its own link, instead of adding a link to the plain version.
+
+_OFFSET_SUFFIX_RE = re.compile(r"\s+\d+\.\d{2}$")          # the " 0.14" the script adds
+_INSTRUMENTAL_RE = re.compile(r"\b(?:instrumental|karaoke)\b", re.I)
+
+
+def _strip_song_decorations(text: str) -> str:
+    """Remove everything that does not change WHICH RECORDING a title names:
+    the offset the script appends, its own (instrumental)/(yt-top-result) tags,
+    Finder copy suffixes, and the release tags a service returns — (From <film>),
+    (feat. ...), (Official Audio), - Remastered 2011."""
+    s = text
+    for _ in range(8):                       # they stack: "T (instrumental) 0.14"
+        before = s
+        # The "A - " batch tag from next_batch_letter(). It groups one run's
+        # candidates in the Finder; it does not name a different recording, so
+        # a tagged file still counts as "we already have this song".
+        s = re.sub(r"^[A-Z]{1,2} - ", "", s)
+        s = _OFFSET_SUFFIX_RE.sub("", s)
+        s = re.sub(r"\s*[\(\[](?:instrumental|karaoke|yt-top-result)[\)\]]\s*$", "", s, flags=re.I)
+        s = re.sub(r"\s*[\(\[](?:official\s+)?(?:audio|video|music\s+video|lyrics?|lyric\s+video|visualizer|hd|hq)[\)\]]\s*$", "", s, flags=re.I)
+        # The same tags again WITHOUT brackets, which is how a YouTube title
+        # spells them: "Take My Hand Lyrics". Without this the file reads as a
+        # different song from "Take My Hand" and collects its own links.
+        # A bare "Audio"/"Video"/"HD" is NOT stripped on its own — too many real
+        # titles end in those words — so it only comes off after "Official".
+        s = re.sub(r"\s+(?:official\s+(?:music\s+video|video|audio)"
+                   r"|music\s+video|lyric\s+video|lyrics?|visualizer)\s*$",
+                   "", s, flags=re.I)
+        s = re.sub(r"\s*[\(\[](?:from|feat\.?|featuring|ft\.?|with|prod\.?)\b[^\)\]]*[\)\]]\s*$", "", s, flags=re.I)
+        s = re.sub(r"\s*[-–]\s*remastered(?:\s+\d{4})?\s*$", "", s, flags=re.I)
+        # Edition tags. These name the SAME recording, so "Never Be the Same
+        # (Radio Edit)" and "Never Be the Same" must reduce to one title — that
+        # is how the script tells "one song under two names" apart from "two
+        # different songs". Slowed / sped up / reverb are NOT here: those are
+        # real cuts and _title_variants() keeps them as their own version.
+        _EDITIONS = (r"radio\s+edit|radio\s+version|album\s+version|single\s+version"
+                     r"|original\s+version|original\s+mix|main\s+version"
+                     r"|clean\s+version|explicit\s+version|bonus\s+track")
+        s = re.sub(rf"\s*[\(\[](?:{_EDITIONS})[\)\]]\s*$", "", s, flags=re.I)
+        s = re.sub(rf"\s+(?:{_EDITIONS})\s*$", "", s, flags=re.I)
+        s = re.sub(r"\s*\(\d+\)\s*$", "", s)                     # " (1)" duplicate
+        s = re.sub(r"\s+copy(?:\s+\d+)?$", "", s, flags=re.I)    # " copy 2"
+        s = s.strip(" -–—_")
+        if s == before:
+            break
+    return s.strip()
+
+
+# Words that only ever qualify an edit name, never a song title on their own.
+# They come off only when they sit against a variant word, so "Super Slowed"
+# reduces to nothing while "Super Bass" keeps its "Super".
+_VARIANT_HEAD_WORDS = r"super|ultra|mega|hyper|extra|very"
+_VARIANT_HEAD = rf"(?:{_VARIANT_HEAD_WORDS})"
+_VARIANT_TAIL = r"(?:version|ver|edit|mix)"
+
+
+def _strip_variant_words(text: str) -> str:
+    """Take the edit names out of a title. The variants are compared as their
+    own set, so 'Woops (Slowed + Reverb)' and 'Woops' reduce to the same title
+    and are told apart by the variant set instead."""
+    out = text
+    for spellings in _VARIANT_FAMILIES.values():
+        for spelling in sorted(spellings, key=len, reverse=True):
+            pattern = (rf"\b(?:{_VARIANT_HEAD}\s+)?{re.escape(spelling)}"
+                       rf"(?:\s+{_VARIANT_TAIL})?\b")
+            out = re.sub(pattern, " ", out, flags=re.I)
+    return out
+
+
+def _title_variants(text: str) -> frozenset:
+    """The edit names a title carries — slowed, sped up, reverb, and the rest of
+    _VARIANT_FAMILIES. Two files are the same version of a song only when these
+    sets are equal.
+
+    An intensifier stays attached, so "Super Slowed" and "Ultra Slowed" are two
+    different versions and each keeps its own file. Being strict here is the
+    safe direction: the worst case is one extra download, while being loose
+    would stamp a reel link onto the wrong cut of the song."""
+    hay = text.lower()
+    # "superslowed" -> "super slowed", so the run-together spelling reads the same
+    hay = re.sub(rf"\b({_VARIANT_HEAD_WORDS})(slowed|sped\s*up|reverb|nightcore)\b",
+                 r"\1 \2", hay)
+    found = set()
+    for canon, spellings in _VARIANT_FAMILIES.items():
+        for spelling in sorted(spellings, key=len, reverse=True):
+            m = re.search(rf"\b({_VARIANT_HEAD})\s+{re.escape(spelling)}\b", hay)
+            if m:
+                found.add(f"{m.group(1)} {canon}")
+                break
+            if _has_marker(hay, spelling):
+                found.add(canon)
+                break
+    return frozenset(found)
+
+
+def _norm_key(text: str) -> str:
+    """Lower-case, accent-free, punctuation-free form for comparing names."""
+    s = unicodedata.normalize("NFKD", text or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"[^a-z0-9]+", " ", s.lower())
+    return " ".join(s.split())
+
+
+def _norm_song_title(title: str) -> str:
+    """The comparable form of a song title: decorations and edit names removed."""
+    return _norm_key(_strip_variant_words(_strip_song_decorations(title or "")))
+
+
+def _is_instrumental(text: str) -> bool:
+    return bool(_INSTRUMENTAL_RE.search(text or ""))
+
+
+def _artists_conflict(a: str, b: str) -> bool:
+    """True only when two artist names are both known AND disagree. Songs saved
+    before tagging carry no artist, so they never conflict — the title and the
+    variant set decide those."""
+    a, b = _norm_key(a), _norm_key(b)
+    if not a or not b:
+        return False
+    return not (a in b or b in a)
+
+
+_LIBRARY_CACHE: list | None = None
+
+
+def library_songs(refresh: bool = False) -> list:
+    """Every song in the Music tree with the identity we match on. Reads the
+    song's own ID3 tags first — they survive a rename — and falls back to the
+    filename for files saved before tagging. Cached for the run."""
+    global _LIBRARY_CACHE
+    if _LIBRARY_CACHE is not None and not refresh:
+        return _LIBRARY_CACHE
+    songs = []
+    for raw_path in _all_audio_paths():
+        path = Path(raw_path)
+        tags = read_tags(path)
+        tag_title = tags.get("title", "")
+        # The filename still names the cut when the tag is bare or was trimmed,
+        # so read the edit markers off both.
+        markers = f"{tag_title} {path.stem}"
+        # Match on the tag title OR the filename. Some files arrived with a tag
+        # that spells out the artists too ("VOJ x Narvent - Memory Reboot"),
+        # which no fresh identification of "Memory Reboot" would ever equal;
+        # their filename is the clean title. After a rename it is the other way
+        # round, and the tag is the one that survived.
+        titles = {_norm_song_title(x) for x in (tag_title, path.stem) if x}
+        songs.append({
+            "path": path,
+            "titles": frozenset(t for t in titles if t),
+            "artist": tags.get("artist", ""),
+            "instrumental": _is_instrumental(markers),
+            "variants": _title_variants(markers),
+        })
+    _LIBRARY_CACHE = songs
+    return songs
+
+
+def find_existing_song(title: str, artist: str, instrumental: bool) -> list:
+    """Library files that are the SAME VERSION of this song — same title, same
+    edit variants, same instrumental-or-not, and no conflicting artist. Returns
+    an empty list when the library doesn't hold it yet."""
+    want_title = _norm_song_title(title)
+    if not want_title:
+        return []
+    want_variants = _title_variants(f"{title} {VARIANT_HINT}")
+    matches = []
+    for song in library_songs():
+        if want_title not in song["titles"]:
+            continue
+        if song["variants"] != want_variants:
+            continue                        # a slowed cut is its own version
+        if song["instrumental"] != bool(instrumental):
+            continue
+        if _artists_conflict(song["artist"], artist):
+            continue
+        matches.append(song["path"])
+    return sorted(matches)
+
+
+def sync_links(dry_run: bool = True) -> None:
+    """Give EVERY copy of a song the same set of source links.
+
+    The library holds a song several times over: an instrumental cut, a "Lyrics"
+    rip, a Finder "copy", the same file in two category folders. Each copy used
+    to collect only the reels it was itself downloaded from, so Cmd+G showed a
+    different answer depending on which copy Sam happened to click. This unions
+    the links across every copy and writes the union back to all of them.
+
+    A group is one title with one edit. A Finder "copy", an instrumental cut and
+    a "Lyrics" rip all hold the same recording, so they share their links. A
+    slowed, sped-up or reverb edit does NOT: it is a different cut, and a reel
+    that played it should only show up on that cut. Sam chose this on
+    2026-08-14. Two different songs that share a title are told apart by their
+    artist tags — but almost nothing in the library is tagged, so a genuine
+    same-title clash would merge. The cost of that is one extra link.
+
+    Lines in a comment that are not links are left alone on the file that has
+    them — they are Sam's own notes, not something to copy around."""
+    songs = library_songs()
+    if not songs:
+        print("No songs found.")
+        return
+
+    parent = list(range(len(songs)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    by_title: dict = {}
+    for i, s in enumerate(songs):
+        for t in s["titles"]:
+            by_title.setdefault(t, []).append(i)
+
+    for idxs in by_title.values():
+        for pos, a in enumerate(idxs):
+            for b in idxs[pos + 1:]:
+                if songs[a]["variants"] != songs[b]["variants"]:
+                    continue        # a slowed cut keeps its own reels
+                if not _artists_conflict(songs[a]["artist"], songs[b]["artist"]):
+                    union(a, b)
+
+    groups: dict = {}
+    for i in range(len(songs)):
+        groups.setdefault(find(i), []).append(i)
+
+    ledger = ledger_load()
+    changed = groups_touched = 0
+
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        paths = sorted((songs[i]["path"] for i in members), key=lambda p: str(p).lower())
+
+        own: dict = {}          # path -> (its own source lines, its own notes)
+        shared: list = []       # every source in the group, oldest copy first
+        seen_posts: set = set()
+
+        def remember(u: str) -> None:
+            if not _is_source_line(u):
+                return
+            key = _same_post(u)
+            if key not in seen_posts:
+                seen_posts.add(key)
+                shared.append(u)
+
+        for p in paths:
+            links, notes = [], []
+            for line in _finder_comment_text(p).splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                (links if _is_source_line(line) else notes).append(line)
+            own[p] = (links, notes)
+            for u in links:
+                remember(u)
+            remember(ledger.get(p.name, "").strip())
+
+        if not shared:
+            continue
+
+        for p in paths:
+            links, notes = own[p]
+            desired = notes + shared
+            current = [l.strip() for l in _finder_comment_text(p).splitlines() if l.strip()]
+            if desired == current:
+                continue
+            have = {_same_post(u) for u in links}
+            gained = len([u for u in shared if _same_post(u) not in have])
+            rel = p.relative_to(OUTPUT_DIR) if str(p).startswith(str(OUTPUT_DIR)) else p
+            what = f"{gained} link(s)" if gained else "tidy duplicate lines"
+            print(f"  {'would add' if dry_run else 'added'} {what} -> {rel}")
+            if not dry_run and not set_finder_comment(p, "\n".join(desired)):
+                print(f"    !! could not write the comment for {p.name}")
+                continue
+            changed += 1
+        groups_touched += 1
+
+    if dry_run:
+        print(f"\nDry run: {changed} file(s) in {groups_touched} song(s) would gain links.")
+        print("Run `song --sync-links --write` to apply it.")
+    else:
+        print(f"\nUpdated {changed} file(s) across {groups_touched} song(s).")
+
+
+def reel_index_load() -> dict:
+    """{same-post key: song filename}. Missing file is simply an empty index."""
+    out: dict = {}
+    if REEL_INDEX_PATH.exists():
+        for line in REEL_INDEX_PATH.read_text(encoding="utf-8",
+                                              errors="replace").splitlines():
+            if "\t" in line:
+                key, name = line.split("\t", 1)
+                if key and name:
+                    out[key] = name
+    return out
+
+
+def reel_index_add(url: str, song_name: str) -> None:
+    """Record that `url` is where `song_name` came from. Cheap and idempotent."""
+    if not url or not song_name:
+        return
+    key = _same_post(url)
+    idx = reel_index_load()
+    if idx.get(key) == song_name:
+        return
+    idx[key] = song_name
+    REEL_INDEX_PATH.write_text(
+        "\n".join(f"{k}\t{v}" for k, v in sorted(idx.items())) + "\n",
+        encoding="utf-8")
+
+
+def reel_already_sourced(url: str) -> Path | None:
+    """The song this reel already gave us, or None. The filename is checked
+    against the library, so an index entry for a song Sam later deleted does not
+    block a fresh run."""
+    if not url:
+        return None
+    name = reel_index_load().get(_same_post(url))
+    if not name:
+        return None
+    for song in library_songs():
+        if song["path"].name == name:
+            return song["path"]
+    for song in library_songs():        # renamed? fall back to the stem
+        if song["path"].stem.lower().startswith(Path(name).stem.lower()[:24]):
+            return song["path"]
+    return None
+
+
+def rebuild_reel_index() -> None:
+    """Seed the index from every Get Info comment in the library. Slow (one
+    Finder call per file whose xattr is empty), so it is a one-off command."""
+    songs = library_songs()
+    print(f"Reading the Get Info comment of {len(songs)} songs...")
+    idx: dict = {}
+    ledger = ledger_load()
+    for i, song in enumerate(songs, 1):
+        if i % 100 == 0:
+            print(f"  {i}/{len(songs)}")
+        p = song["path"]
+        lines = [l.strip() for l in _finder_comment_text(p).splitlines() if l.strip()]
+        seed = ledger.get(p.name, "").strip()
+        if seed:
+            lines.append(seed)
+        for line in lines:
+            if _is_source_line(line):
+                idx.setdefault(_same_post(line), p.name)
+    REEL_INDEX_PATH.write_text(
+        "\n".join(f"{k}\t{v}" for k, v in sorted(idx.items())) + "\n",
+        encoding="utf-8")
+    print(f"Indexed {len(idx)} reel(s) -> {REEL_INDEX_PATH}")
+
+
+def _tag_title_from_stem(stem: str) -> str:
+    """The title to write into an untagged file, taken from its filename. Only
+    the script's OWN additions come off — the offset, (yt-top-result) and the
+    duplicate suffixes. The edit markers stay, because "(Slowed + Reverb)" and
+    "(instrumental)" say which version the file is, and that has to survive a
+    rename."""
+    s = _OFFSET_SUFFIX_RE.sub("", stem)
+    s = re.sub(r"\s*\(yt-top-result\)\s*", " ", s, flags=re.I)
+    s = re.sub(r"\s*\(\d+\)\s*$", "", s)
+    s = re.sub(r"\s+copy(?:\s+\d+)?$", "", s, flags=re.I)
+    return " ".join(s.split()).strip()
+
+
+def backfill_tags(dry_run: bool = True) -> None:
+    """Write an ID3 title into every library song that has none, taken from its
+    filename. Songs saved before tagging have only their filename, so a rename
+    makes the library forget them. This gives each one an identity that rides
+    inside the file.
+
+    Each file's Finder comment is read before the write and checked after, to
+    prove the source link survived."""
+    paths = [Path(p) for p in _all_audio_paths() if Path(p).suffix.lower() == ".mp3"]
+    todo = [p for p in paths if not read_tags(p).get("title")]
+    print(f"{len(paths)} songs, {len(todo)} without a title tag.")
+    if dry_run:
+        for p in todo[:15]:
+            print(f"  would tag: {p.name}  ->  {_tag_title_from_stem(p.stem)}")
+        if len(todo) > 15:
+            print(f"  ... and {len(todo) - 15} more")
+        print("\nDry run. Run `song --backfill-tags --write` to apply.")
+        return
+
+    done = failed = lost = 0
+    for p in todo:
+        before = _finder_comment_text(p)
+        if write_tags(p, title=_tag_title_from_stem(p.stem)):
+            done += 1
+        else:
+            failed += 1
+            continue
+        if before and _finder_comment_text(p) != before:
+            lost += 1
+            print(f"  WARNING: comment changed on {p.name}")
+            set_finder_comment(p, before)      # put it back
+    print(f"Tagged {done} songs. {failed} failed. {lost} comments restored.")
+
+
+def finalize_song(audio_path: Path, source_url: str, reindex: bool = True,
+                  title: str = "", artist: str = "") -> Path:
     """Register a freshly-downloaded song. The file stays FLAT where it is
     (in OUTPUT_DIR) — no per-song wrapper folder. We record its source URL in
     the links ledger (keyed by filename, so it follows the file when dragged
-    into a category), embed the URL as a Finder comment as a backup, and
-    refresh the clickable _Song Links.rtf indexes. Returns the audio path.
+    into a category), stamp the song's title/artist into its ID3 tags (so a
+    later rename can't lose which song it is), embed the URL as a Finder comment
+    as a backup, and refresh the clickable _Song Links.rtf indexes. Returns the
+    audio path.
     """
     ledger_set(audio_path.name, source_url)
+    write_tags(audio_path, title=title, artist=artist)   # before the xattr write
     set_finder_comment(audio_path, source_url)
+    reel_index_add(source_url, audio_path.name)
     if reindex:
         reindex_all()
     return audio_path
@@ -676,6 +1344,56 @@ def _decode_meta_text(raw: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# "Original sound" in the languages TikTok and Instagram localise it into. A
+# placeholder title is not a song, so the caller must fingerprint the audio
+# instead of trusting it. Sam hit the Croatian "izvorni zvuk" on 2026-08-16: the
+# script searched YouTube for that phrase and downloaded an unrelated track.
+_ORIGINAL_SOUND_TITLES = (
+    "original sound", "original audio", "originalton", "original lyd",
+    "originallyd", "originalljud", "som original", "sonido original",
+    "son original", "suono originale", "izvorni zvuk", "originalni zvuk",
+    "originalni ton", "origineel geluid", "oryginalny dźwięk",
+    "originální zvuk", "originálny zvuk", "sunet original", "eredeti hang",
+    "alkuperäinen ääni", "orijinal ses", "özgün ses", "suara asli",
+    "bunyi asal", "âm thanh gốc", "orihinal na tunog", "оригинальный звук",
+    "оригінальний звук", "арыгінальны звук", "αρχικός ήχος", "צליל מקורי",
+    "الصوت الأصلي", "मूल ऑडियो", "เสียงต้นฉบับ", "オリジナル楽曲",
+    "オリジナル音源", "원본 오디오", "오리지널 사운드", "原声", "原创音频",
+)
+
+
+def _is_original_sound_title(title: str) -> bool:
+    """True when the track title is the platform's "original sound" placeholder
+    in any language."""
+    low = (title or "").lower()
+    return any(p in low for p in _ORIGINAL_SOUND_TITLES)
+
+
+def _norm_handle(text: str) -> str:
+    """Keep the letters and digits only, in lower case. This makes the account
+    name "KOMA_ZONE" equal to the URL handle "koma_zone"."""
+    return re.sub(r"[^0-9a-z]", "", _decode_meta_text(text or "").lower())
+
+
+def _artist_is_the_uploader(artist: str, html: str, url: str) -> bool:
+    """True when the track is credited to the account that posted the video.
+    TikTok does that for an original sound only, in every language, so this test
+    works where the title list and the "original" boolean both fail.
+
+    A real musician who posts their own song trips this test as well. The cost is
+    only the fingerprint pass, which then names the song correctly, so the test
+    fails in the safe direction."""
+    who = _norm_handle(artist)
+    if not who:
+        return False
+    names = re.findall(r'"uniqueId":"([^"]+)"', html)[:1]
+    names += re.findall(r'"nickname":"([^"]+)"', html)[:1]
+    handle = re.search(r"tiktok\.com/@([^/?#]+)", url, re.I)
+    if handle:
+        names.append(handle.group(1))
+    return any(who == _norm_handle(n) for n in names)
+
+
 def extract_tiktok_music_metadata(url: str) -> dict | None:
     """Extract song metadata and audio URL directly from TikTok page."""
     import urllib.request
@@ -713,13 +1431,24 @@ def extract_tiktok_music_metadata(url: str) -> dict | None:
             artist = _decode_meta_text(author_match.group(1)) if author_match else "Unknown Artist"
             play_url = _decode_meta_text(play_url_match.group(1)) if play_url_match else None
 
-            # Skip original sound entries (language-independent boolean check)
-            original_match = re.search(r'"original"\s*:\s*(true|false)', music_json)
+            # Skip an original sound entry. The code makes three tests, because
+            # no single test covers every page TikTok serves.
+            # Test 1: the "original" boolean. The music regex above stops at the
+            # first "}", and the mobile page holds no "original" key in the music
+            # object at all, so search the whole page as well.
+            original_match = (
+                re.search(r'"original"\s*:\s*(true|false)', music_json)
+                or re.search(r'"original"\s*:\s*(true|false)', html)
+            )
             if original_match and original_match.group(1) == "true":
                 return None
 
-            # Fallback: skip by title string matching
-            if "original sound" in title.lower() or title.startswith("som original"):
+            # Test 2: the artist is the account that posted the video.
+            if _artist_is_the_uploader(artist, html, url):
+                return None
+
+            # Test 3: the title is the placeholder in some language.
+            if _is_original_sound_title(title):
                 return None
 
             return {
@@ -760,7 +1489,12 @@ def extract_instagram_music_metadata(url: str) -> dict | None:
 
         shortcode = shortcode_match.group(2)
 
-        L = instaloader.Instaloader()
+        # Instagram answers graphql/query with 403 unless you are logged in, and
+        # there is no saved instaloader session here, so this fallback cannot
+        # succeed. It stays in case a session is ever added, but it must not
+        # retry: the default retries printed "403 Forbidden [retrying; skip with
+        # ^C]" and stalled the run for seconds before failing anyway.
+        L = instaloader.Instaloader(quiet=True, max_connection_attempts=1)
         post = instaloader.Post.from_shortcode(L.context, shortcode)
 
         if hasattr(post, '_node') and 'clips_music_attribution_info' in post._node:
@@ -823,7 +1557,7 @@ def _extract_instagram_music_from_embed(url: str) -> dict | None:
 
             if uses_original:
                 return None
-            if "original sound" in title.lower() or "original audio" in title.lower():
+            if _is_original_sound_title(title):
                 return None
 
             return {
@@ -851,7 +1585,7 @@ def _extract_instagram_music_from_embed(url: str) -> dict | None:
         artist = parts[0].strip()
         title = parts[1].strip()
 
-        if "original sound" in title.lower() or "original audio" in title.lower():
+        if _is_original_sound_title(title):
             return None
 
         return {
@@ -994,6 +1728,20 @@ def extract_local_audio(file_path: Path, output_path: Path) -> bool:
     return output_path.exists()
 
 
+def cookie_args(url: str) -> list[str]:
+    """yt-dlp cookie flags for this URL. Instagram and TikTok ALWAYS run
+    anonymously: Chrome login cookies on scripted IG traffic got Sam's main
+    account an automated-behavior flag (2026-09-16) and then a reels posting
+    block. TikTok went anonymous 2026-09-19 before the same thing happened
+    there. Anonymous access works on both (IG verified 2026-09-17; ~/bin/hook
+    always downloaded TikTok without cookies). YouTube keeps Chrome cookies —
+    it needs them to dodge the 403 rate limit."""
+    low = url.lower()
+    if "instagram.com" in low or "tiktok.com" in low:
+        return []
+    return ["--cookies-from-browser", "chrome"]
+
+
 def download_source_audio(url: str, output_path: Path, source_url: str = "") -> bool:
     """Download audio from Instagram/TikTok using yt-dlp."""
     print(f"Downloading audio from source...")
@@ -1005,7 +1753,7 @@ def download_source_audio(url: str, output_path: Path, source_url: str = "") -> 
 
     cmd = [
         "yt-dlp",
-        "--cookies-from-browser", "chrome",
+        *cookie_args(url),
         "-x",
         "--audio-format", "mp3",
         "--audio-quality", "0",
@@ -1414,11 +2162,16 @@ async def identify_song_candidates(
     source_label: str = "",
     seen_keys: set | None = None,
     min_acr_score: int = 50,
+    hit_counts: dict | None = None,
 ) -> list[dict]:
     """Run all 3 services across all segments. Keep ACRCloud matches with
     score >= min_acr_score (default 50) plus every unique AudD/Shazam match.
     Pass `seen_keys` to extend a dedupe set across multiple calls (e.g. raw
-    audio + demucs stem)."""
+    audio + demucs stem).
+    Pass `hit_counts` to also collect how many times EACH song was named. A
+    repeat is printed as "dup:" and dropped from the candidate list, but the
+    count still tells you which song the services agree on — see
+    `pick_confident_winner()`."""
     total_duration = get_audio_duration(audio_path)
     samples = []
     temp_dir = audio_path.parent
@@ -1452,6 +2205,8 @@ async def identify_song_candidates(
     candidates: list[dict] = []
     if seen_keys is None:
         seen_keys = set()
+    if hit_counts is None:
+        hit_counts = {}
 
     src_tag = f" {source_label}" if source_label else ""
 
@@ -1459,6 +2214,7 @@ async def identify_song_candidates(
         if not result:
             return False
         key = (result["artist"].lower().strip(), result["title"].lower().strip())
+        hit_counts[key] = hit_counts.get(key, 0) + 1
         score = result.get("score")
         score_str = f" (score {score})" if score is not None else ""
         if key in seen_keys:
@@ -1497,8 +2253,87 @@ async def identify_song_candidates(
     return candidates
 
 
+def _candidate_key(c: dict) -> tuple:
+    return (c["artist"].lower().strip(), c["title"].lower().strip())
+
+
+def pick_confident_winner(candidates: list[dict], hit_counts: dict) -> dict | None:
+    """The one song to download, but ONLY when every candidate is that same song
+    under a different name. Returns None the moment the services name two
+    genuinely different songs — that is Sam's call to make, not the script's.
+
+    An earlier version picked whichever name had the most hits. That looked
+    right until reel #17 (2026-08-14): a re-upload called "Norhye - cis!" was
+    registered across every service and scored 13 hits, while the real record —
+    Cigarettes After Sex, "Apocalypse" — scored 1. The script saved the bootleg
+    name and never showed Sam the alternatives. Hit count measures how well a
+    recording is INDEXED, not whether it is the right song, so it must not
+    decide between different songs. It only breaks a tie between spellings of
+    one song."""
+    if len(candidates) < 2:
+        return None
+    top = max(candidates, key=lambda c: hit_counts.get(_candidate_key(c), 0))
+
+    # Every candidate is one song under different spellings -> safe to collapse.
+    if len({_norm_song_title(c["title"]) for c in candidates}) == 1:
+        return top
+
+    # The names disagree. Collapsing is still safe when the leader is a song the
+    # library ALREADY holds: nothing new gets downloaded and no junk name is
+    # created — the reel link just joins a song Sam already chose to keep. That
+    # is reel #18, where three spellings of "Sweater Weather" (including the
+    # nonsense artist "JHON MARSEL") all pointed at a record he owned.
+    if _owned_either_variant(top):
+        return top
+
+    # Leader is a song Sam does not own, and the services named other songs.
+    # This is reel #17. Downloading the leader alone would have hidden the real
+    # record behind a re-upload's name. Hand him the lettered batch instead.
+    return None
+
+
+def _owned_either_variant(cand: dict) -> bool:
+    """Is this song already in the library, as the plain cut or instrumental?"""
+    return any(find_existing_song(cand["title"], cand["artist"], inst)
+               for inst in (False, True))
+
+
+def next_batch_letter(output_dir: Path) -> str:
+    """A short prefix that ties the candidates of ONE run together, e.g.
+    "A - Take My Hand.mp3" next to "A - Jamaica Waterfall.mp3". Sam plays the
+    files, finds the real song, and then knows every other file with the same
+    letter came from the same reel and can go.
+
+    The letter is only taken while its files are still sitting in the flat
+    folder, so deleting a resolved batch frees the letter again. Only the top
+    level is scanned: filing a keeper into a category folder releases it too."""
+    import string
+
+    used = set()
+    if output_dir.is_dir():
+        for p in output_dir.glob("*.mp3"):
+            m = re.match(r"^([A-Z]{1,2}) - ", p.name)
+            if m:
+                used.add(m.group(1))
+    for ch in string.ascii_uppercase:
+        if ch not in used:
+            return ch
+    for first in string.ascii_uppercase:          # 26 batches open at once is
+        for second in string.ascii_uppercase:     # already unlikely, but don't
+            if f"{first}{second}" not in used:    # collide if it happens.
+                return f"{first}{second}"
+    return "ZZ"
+
+
+# Songs per lettered batch. Set high on purpose: the RIGHT song is often the one
+# with a single hit (Cigarettes After Sex - "Apocalypse" had 1, against 13 for a
+# re-upload), so a tight cap throws away the answer Sam is looking for. This is
+# only a backstop against a pathological reel, not a curation step.
+MAX_LETTER_CANDIDATES = 5
+
+
 def download_candidates_flat(
-    candidates: list[dict], source_url: str
+    candidates: list[dict], source_url: str, hit_counts: dict | None = None
 ) -> tuple[int, Path]:
     """For 2+ candidates: download each one as a FLAT mp3 in OUTPUT_DIR (plus a
     YouTube top-result per unique title), recording each source URL in the links
@@ -1509,25 +2344,63 @@ def download_candidates_flat(
     # channels or title-coincident songs). Add a "title-only" pseudo-candidate
     # per unique title so we also grab YouTube's top organic result for the bare
     # title — what a human would search.
-    augmented: list[dict] = list(candidates)
-    seen_titles: set[str] = set()
-    for c in candidates:
-        title_key = c["title"].lower().strip()
-        if title_key in seen_titles:
-            continue
-        seen_titles.add(title_key)
-        augmented.append({
-            "artist": "",
-            "title": c["title"],
-            "service": "yt-title-search",
-            "segment": "",
-            "title_only": True,
-        })
+    hit_counts = hit_counts or {}
 
+    # Collapse the spellings of one song ("Apocalypse" and "Apocalypse (loop)")
+    # and keep only the strongest few. Five candidates, two variants each, plus
+    # a title-only extra each, is twenty files for one reel — worse than the
+    # problem the letters solve. Hit count is a fine way to RANK these; it is
+    # only unsafe as a way to pick one and hide the rest.
+    best_by_title: dict = {}
+    for c in candidates:
+        key = _norm_song_title(c["title"]) or c["title"].lower().strip()
+        # On a tie the SHORTER title wins, so "Apocalypse" beats "Apocalypse
+        # (loop)" and the batch shows the clean release name, not a re-upload's.
+        rank = (hit_counts.get(_candidate_key(c), 0), -len(c["title"]))
+        if key not in best_by_title or rank > best_by_title[key][0]:
+            best_by_title[key] = (rank, c)
+    ranked = [c for _h, c in sorted(best_by_title.values(),
+                                    key=lambda hc: hc[0], reverse=True)]
+    dropped = ranked[MAX_LETTER_CANDIDATES:]
+    candidates = ranked[:MAX_LETTER_CANDIDATES]
+    if dropped:
+        names = ", ".join(f"{c['artist']} - {c['title']}" for c in dropped)
+        print(f"Keeping the {len(candidates)} strongest guesses. Not downloading: {names}")
+
+    augmented: list[dict] = list(candidates)
+    # The title-only extra exists to survive a WRONG ARTIST on a lone candidate.
+    # With several candidates already in the batch it only adds files to delete.
+    if len(candidates) <= 2:
+        seen_titles: set[str] = set()
+        for c in candidates:
+            title_key = c["title"].lower().strip()
+            if title_key in seen_titles:
+                continue
+            seen_titles.add(title_key)
+            augmented.append({
+                "artist": "",
+                "title": c["title"],
+                "service": "yt-title-search",
+                "segment": "",
+                "title_only": True,
+            })
+
+    # Every file this run writes carries the same letter, so Sam can play them,
+    # find the real song, and delete the rest of the letter without checking
+    # each one with Cmd+G.
+    batch = next_batch_letter(OUTPUT_DIR)
+    print(f"Tagging this batch \"{batch}\" — every file below starts with \"{batch} - \".")
+
+    # A candidate Sam ALREADY owns is never downloaded, so it never appears in
+    # the lettered batch — and on reel #17 that hid the right answer completely.
+    # Every file under "A" was a wrong guess while the real record, Cigarettes
+    # After Sex "Apocalypse", sat in the library uncredited. Collect those and
+    # name them at the end.
+    already_owned: dict = {}
     saved = 0
     for c in augmented:
         artist = c["artist"]
-        title = c["title"]
+        title = _strip_instrumental_tag(c["title"])
         service = c.get("service", "alt")
         title_only = c.get("title_only", False)
         display_name = title if title_only else f"{artist} - {title}"
@@ -1537,13 +2410,34 @@ def download_candidates_flat(
             inst_suffix = " (instrumental)" if instrumental else ""
             variant = "instrumental" if instrumental else "normal"
             if title_only:
-                basename = sanitize_filename(f"{title}{inst_suffix} (yt-top-result)")
+                basename = sanitize_filename(f"{batch} - {title}{inst_suffix} (yt-top-result)")
             else:
-                basename = sanitize_filename(f"{title}{inst_suffix}")
+                basename = sanitize_filename(f"{batch} - {title}{inst_suffix}")
             flat_audio = OUTPUT_DIR / f"{basename}.mp3"
 
-            if flat_audio.exists():
-                print(f"  [{service}] already saved: {basename}")
+            # Never download a second copy of a song the library already holds.
+            # Stamp the reel into the copies Sam has instead — that IS the point
+            # of the run. Sam set this default on 2026-08-14, after reel #17:
+            # the right song (Cigarettes After Sex, "Apocalypse") was already in
+            # the library, so it was skipped silently and the reel went
+            # uncredited while four wrong guesses filled the lettered batch.
+            #
+            # The earlier code refused to link here, reasoning that only one
+            # candidate is really in the reel. That is true, and it means a
+            # wrong candidate Sam happens to own can pick up a link it did not
+            # earn. He chose that cost: a spare link is easy to see and remove,
+            # a missing one is invisible.
+            owned = find_existing_song(title, artist, instrumental)
+            if flat_audio.exists() or owned:
+                where = flat_audio.name if flat_audio.exists() else owned[0].name
+                print(f"  [{service}] already saved: {where}")
+                for p in owned:
+                    added, total = append_finder_comment(p, source_url)
+                    if added:
+                        print(f"      linked this reel into its Get Info ({total} links)")
+                    already_owned.setdefault(title, [])
+                    if p not in already_owned[title]:
+                        already_owned[title].append(p)
                 saved += 1
                 continue
 
@@ -1557,12 +2451,29 @@ def download_candidates_flat(
                 print(f"  [{service}] YouTube download failed for {display_name} ({variant})")
                 continue
 
-            finalize_song(flat_audio, source_url, reindex=False)
+            finalize_song(flat_audio, source_url, reindex=False,
+                          title=f"{title}{inst_suffix}", artist=artist)
             print(f"  [{service}] saved: {basename}")
             saved += 1
 
     if saved:
         reindex_all()
+
+    if already_owned:
+        print(f"\nAlready in your library, so NOT downloaded into batch {batch}. "
+              f"This reel is now in their Get Info:")
+        for title, paths in already_owned.items():
+            print(f"  \"{title}\"  ({len(paths)} cop{'y' if len(paths) == 1 else 'ies'})")
+            for p in paths[:4]:
+                try:
+                    print(f"      {p.relative_to(OUTPUT_DIR)}")
+                except ValueError:
+                    print(f"      {p}")
+            if len(paths) > 4:
+                print(f"      ...and {len(paths) - 4} more")
+        print("  If one of these is the song, batch "
+              f"{batch} is all wrong — delete it.")
+
     return saved, OUTPUT_DIR
 
 
@@ -1591,7 +2502,9 @@ _ALWAYS_JUNK = (
 # canonical name, values the spellings seen in YouTube titles.
 _VARIANT_FAMILIES = {
     "sped up":   ("sped up", "sped-up", "spedup", "speed up", "speeded up"),
-    "slowed":    ("slowed", "slowed down", "slow down", "slowed reverb"),
+    # "super slowed" / "ultra slowed" already match on "slowed"; the run-together
+    # spelling needs its own entry because \b won't break inside the word.
+    "slowed":    ("slowed", "slowed down", "slow down", "slowed reverb", "superslowed"),
     "reverb":    ("reverb",),
     "nightcore": ("nightcore",),
     "remix":     ("remix", "rmx", "bootleg"),
@@ -1611,7 +2524,19 @@ VARIANT_HINT: str = ""
 # it reliably lands on the plain audio rather than the music video.
 _VOCAL_BONUS = (("lyrics", 30), ("official audio", 28), ("(audio)", 24))
 
-_GOOD_ENOUGH = 45   # stop querying once a candidate scores this well
+# Stop querying once a candidate scores this well. 70 = only an upload from
+# the artist's OWN channel stops the search early (see _OFFICIAL_BONUS); the
+# best third-party lyric upload tops out at 60, so the later queries still run
+# and can find the official one.
+_GOOD_ENOUGH = 70
+
+# The artist's own channel ("Sleeping At Last", "Yom - Topic", "YOM OFFICIEL",
+# "BillieEilishVEVO") uploads the real recording. 2026-10-21: "Turning Page"
+# took POPuLuv's 318 s "(Lyrics)" re-upload (score 50) over Sleeping At Last's
+# own 256 s "Turning Page" (score 20). Only for plain uploads (_is_plain_upload):
+# music videos carry intros, and montages and medleys are not the song.
+_OFFICIAL_BONUS = 40
+_CHANNEL_SUFFIXES = ("topic", "vevo", "official", "officiel", "oficial", "music", "tv")
 
 # ...but the right KIND of video is not the right SONG. Everything scored below
 # judges only the SHAPE of a result (instrumental vs vocals, wanted edit, sane
@@ -1662,13 +2587,66 @@ def _title_forms(title: str) -> list[str]:
     return forms
 
 
+def _fold(s: str) -> str:
+    """_norm_text with accents removed, so "Beyoncé" == "Beyonce"."""
+    s = unicodedata.normalize("NFKD", s or "")
+    return _norm_text("".join(c for c in s if not unicodedata.combining(c)))
+
+
+def _artist_names(artist: str) -> list[str]:
+    """Every credited name: "A & B", "A, B", "A feat. B", "A x B" -> [A, B].
+    A hit that names ANY of them is by the right act."""
+    parts = re.split(r"\s*(?:&|,|/|\+|\bfeat\.?|\bft\.?|\bfeaturing\b|\bx\b|\band\b|\bwith\b)\s*",
+                     artist or "", flags=re.I)
+    names = [_fold(p) for p in parts]
+    whole = _fold(artist)
+    return [n for n in dict.fromkeys([whole] + names) if n]
+
+
 def _artist_matches(hit: dict, artist: str) -> bool:
-    a = _norm_text(artist)
-    if not a:
-        return False
-    hay = f"{_norm_text(hit.get('title'))} {_norm_text(hit.get('channel'))}"
-    # Squashed compare so a "BillieEilishVEVO" channel still counts.
-    return a in hay or a.replace(" ", "") in hay.replace(" ", "")
+    hay = f"{_fold(hit.get('title'))} {_fold(hit.get('channel'))}"
+    squashed = hay.replace(" ", "")
+    for a in _artist_names(artist):
+        # Whole words, so "Yom" does not match "Yomi"; squashed as well, so a
+        # "BillieEilishVEVO" channel still counts.
+        if re.search(r"\b" + re.escape(a) + r"\b", hay):
+            return True
+        if len(a) >= 5 and a.replace(" ", "") in squashed:
+            return True
+    return False
+
+
+def _is_official_channel(hit: dict, artist: str) -> bool:
+    """Is the uploader the artist (or their Topic / VEVO channel)?"""
+    ch = _fold(hit.get("channel"))
+    for _ in range(2):   # "Artist Official Music" -> "Artist"
+        for suf in _CHANNEL_SUFFIXES:
+            ch = re.sub(r"\s*\b" + suf + r"$", "", ch).strip()
+    squashed = ch.replace(" ", "")
+    for suf in ("vevo", "official"):
+        if squashed.endswith(suf):
+            squashed = squashed[: -len(suf)]
+    return bool(ch) and any(ch == a or squashed == a.replace(" ", "")
+                            for a in _artist_names(artist))
+
+
+# Words an official upload may add around the song name and still be the plain
+# recording. Anything else ("The Barbie Montage", "BRITs 2019") means a cut.
+_PLAIN_EXTRAS = {"official", "audio", "lyric", "lyrics", "visualizer", "visualiser",
+                 "hd", "hq", "explicit", "version", "by", "remastered", "remaster",
+                 "instrumental"}
+
+
+def _is_plain_upload(hit: dict, artist: str, title: str) -> bool:
+    """Is the hit's title just the song name (+ artist, + "Official Audio")?
+    The official-channel bonus is only for these: on 2026-10-21 it picked
+    Billie Eilish's "[The Barbie Montage]" and Calvin Harris's BRITs medley."""
+    name = f" {_fold(hit.get('title'))} "
+    for a in sorted(_artist_names(artist), key=len, reverse=True):
+        name = name.replace(f" {a} ", " ")
+    words = [w for w in name.split() if w not in _PLAIN_EXTRAS]
+    left = " ".join(words)
+    return any(left == _fold(f) for f in _title_forms(title))
 
 
 def _relevance(hit: dict, artist: str, title: str) -> float:
@@ -1688,20 +2666,58 @@ def _relevance(hit: dict, artist: str, title: str) -> float:
     return best
 
 
+def _strip_instrumental_tag(title: str) -> str:
+    """"Turning Page (Instrumental)" -> "Turning Page".
+
+    2026-10-21: Instagram named a reel's track "Sleeping At Last - Turning Page
+    (Instrumental)" because the reel played the instrumental release. The
+    script searched for that title as the SONG, so the vocal file was named
+    "Turning Page (Instrumental).mp3" and the backing track "Turning Page
+    (Instrumental) (instrumental).mp3". Sam wants the song itself plus its
+    instrumental, so both variants start from the base title."""
+    markers = "|".join(re.escape(m) for m in _INSTRUMENTAL_MARKERS)
+    base = re.sub(r"\s*[\(\[][^)\]]*\b(?:" + markers + r")\b[^)\]]*[\)\]]",
+                  "", title or "", flags=re.I)
+    base = re.sub(r"\s+-\s+[^-]*\b(?:" + markers + r")\b.*$", "", base, flags=re.I)
+    return base.strip() or (title or "")
+
+
 def _yt_search(query: str, limit: int = 6) -> list[dict]:
     """Return the top `limit` YouTube hits as dicts (id/duration/channel/title).
-    Uses --flat-playlist so this is one cheap call, not per-video extraction."""
-    cmd = [
+    Uses --flat-playlist so this is one cheap call, not per-video extraction.
+
+    Signed in FIRST. YouTube rate-limits an anonymous search exactly as it does
+    a download, and an empty result here is indistinguishable from "no such
+    song": reel #39 reported "nothing matched" for Ben E. King's "Stand by Me"
+    — one of the best known records ever — because the search itself got a 403.
+    Retry anonymously in case Chrome holds no usable cookie."""
+    base = [
         "yt-dlp",
         "--default-search", f"ytsearch{limit}",
         "--flat-playlist",
         "--no-warnings",
         "--quiet",
         "--print", "%(id)s\t%(duration)s\t%(channel)s\t%(title)s",
-        query,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0 or not result.stdout.strip():
+    # A lettered batch fires a search per candidate per variant, and that burst
+    # still earns a 403 even signed in. So try signed-in, then anonymous, then
+    # signed-in again after a longer pause — by then the burst window has passed.
+    result = None
+    for i, (extra, wait) in enumerate([
+        (["--cookies-from-browser", "chrome"], 0),
+        ([], 2),
+        (["--cookies-from-browser", "chrome"], 8),
+    ]):
+        if wait:
+            time.sleep(wait)
+        result = subprocess.run(base + extra + [query], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            break
+    if result is None or result.returncode != 0 or not result.stdout.strip():
+        # Say WHY. A silent [] used to read as "this song does not exist".
+        err = (result.stderr or "").strip().splitlines()[-1:] if result else []
+        if err and "403" in err[0]:
+            print(f"  !! YouTube refused the search (rate limit): {query}")
         return []
 
     hits = []
@@ -1765,7 +2781,6 @@ def _score_yt_candidate(hit: dict, artist: str, title: str,
                         instrumental: bool, exclude_ids: set,
                         wanted: set | None = None) -> int:
     name = hit["title"].lower()
-    channel = (hit.get("channel") or "").lower()
     duration = hit.get("duration")
     wanted = wanted or set()
 
@@ -1773,14 +2788,31 @@ def _score_yt_candidate(hit: dict, artist: str, title: str,
         return -10_000
 
     # Is this even the right song? Everything below only judges the shape.
-    floor = _MIN_RELEVANCE_WITH_ARTIST if _artist_matches(hit, artist) else _MIN_RELEVANCE
+    by_artist = _artist_matches(hit, artist)
+    floor = _MIN_RELEVANCE_WITH_ARTIST if by_artist else _MIN_RELEVANCE
     if _relevance(hit, artist, title) < floor:
+        return -10_000
+
+    # ...and by the right ARTIST. A title match alone proves nothing when the
+    # title is common. 2026-10-21: the reel named Yom - "Garden of Eden" and
+    # the "lyrics" search led with Lady Gaga - "Garden Of Eden (Lyrics)": title
+    # verbatim, +30 lyrics, +10 title, +5 duration = 45 = _GOOD_ENOUGH, so it
+    # stopped there and saved Lady Gaga. YOM OFFICIEL's own upload scored 30.
+    # The instrumental search did the same with GoJi's "Garden of Eden
+    # (Instrumental)". When we know the artist, a hit must name them in its
+    # title or channel. (No artist = the title-only search, unchanged.)
+    if artist and artist.strip() and not by_artist:
         return -10_000
 
     has_instrumental = any(m in name for m in _INSTRUMENTAL_MARKERS)
 
     if instrumental:
-        score = 60 if has_instrumental else -60
+        # Only a real backing track counts. Before 2026-10-21 a plain upload
+        # scored -60 and could still win, so a song that has no instrumental
+        # (Yom's clarinet track is already one) came back as a second copy.
+        if not has_instrumental:
+            return -10_000
+        score = 60
         # A real instrumental beats someone's piano/guitar rendition.
         if any(w in name for w in ("piano", "guitar", "violin", "cover")):
             score -= 15
@@ -1818,10 +2850,11 @@ def _score_yt_candidate(hit: dict, artist: str, title: str,
         if 120 <= duration <= 420:
             score += 5
 
-    if artist and artist.strip():
-        a = artist.lower()
-        if a in name or a in channel:
-            score += 15
+    if by_artist:
+        score += 15
+        if (_is_official_channel(hit, artist)
+                and _is_plain_upload(hit, artist, title)):
+            score += _OFFICIAL_BONUS
     if title.lower() in name:
         score += 10
 
@@ -1866,6 +2899,9 @@ def search_youtube(artist: str, title: str, instrumental: bool = False,
         # Say so out loud. Downloading nothing beats silently downloading the
         # best-shaped unrelated video, which is what used to happen here.
         print(f"  -> nothing on YouTube matched \"{title}\" closely enough")
+        if instrumental:
+            print("     (no instrumental upload by this artist; the song may "
+                  "already be an instrumental)")
         return None
 
     print(f"  -> {best['title']}")
@@ -1886,15 +2922,30 @@ def download_youtube_mp3(youtube_url: str, output_path: Path, source_url: str = 
     # Download to a temp file first, then add metadata
     temp_output = output_path.parent / f"temp_{output_path.name}"
 
-    # YouTube throws intermittent 403s at the default player client, and one
-    # 403 used to lose the whole variant (you'd get the vocals and silently no
-    # instrumental). Retry on the known-good client instead of giving up.
-    # "ios"/"web_safari" is NOT a fallback any more - it now wants a PO token
-    # and answers "Requested format is not available".
-    attempts = [None, "web_embedded"]
+    # Re-probed 2026-08-14. YouTube's 403 is a RATE LIMIT, not a dead client:
+    # the same client and the same video answered "403 / only images are
+    # available" one minute and downloaded fine the next.
+    #
+    # The rung that actually beats the limit is Sam's own Chrome login. A signed
+    # -in request downloaded a video that had just refused ALL FOUR anonymous
+    # clients in a row. Anonymous clients stay as the fallback for when Chrome
+    # holds no usable cookie. get_video_metadata() already reads the same
+    # cookies, so this is not a new kind of access.
+    #
+    # To re-probe when this rots again:
+    #   yt-dlp --extractor-args "youtube:player_client=X" -F <url>
+    attempts = [
+        (["--cookies-from-browser", "chrome"], "your Chrome login"),
+        (["--extractor-args", "youtube:player_client=tv_simply"], "tv_simply"),
+        (["--extractor-args", "youtube:player_client=android"], "android"),
+        ([], "the default client"),
+        (["--extractor-args", "youtube:player_client=web_embedded"], "web_embedded"),
+    ]
 
     result = None
-    for i, client in enumerate(attempts):
+    for i, (extra, _label) in enumerate(attempts):
+        if i:
+            time.sleep(2 * i)     # back off; the 403 is usually a burst limit
         cmd = [
             "yt-dlp",
             "-x",  # Extract audio
@@ -1904,17 +2955,14 @@ def download_youtube_mp3(youtube_url: str, output_path: Path, source_url: str = 
             "--no-playlist",
             "--quiet",
             "--progress",
-        ]
-        if client:
-            cmd += ["--extractor-args", f"youtube:player_client={client}"]
-        cmd.append(youtube_url)
+        ] + extra + [youtube_url]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0 and temp_output.exists():
             break
         temp_output.unlink(missing_ok=True)   # don't hand a half-file to ffmpeg
         if i < len(attempts) - 1:
-            print("  YouTube refused that request, retrying on player_client=web_embedded...")
+            print(f"  YouTube refused that request, retrying on {attempts[i + 1][1]}...")
 
     if result.returncode != 0:
         print(f"Error downloading from YouTube: {result.stderr}")
@@ -1966,7 +3014,7 @@ def get_video_metadata(url: str) -> tuple[str | None, str | None]:
     Either value may be None if yt-dlp can't read it. Returns (title, id)."""
     cmd = [
         "yt-dlp",
-        "--cookies-from-browser", "chrome",
+        *cookie_args(url),
         "--no-playlist",
         "--quiet",
         "--skip-download",
@@ -2035,7 +3083,7 @@ async def raw_download(url: str):
         source_audio = Path(temp_dir) / "source.mp3"
         cmd = [
             "yt-dlp",
-            "--cookies-from-browser", "chrome",
+            *cookie_args(url),
             "-x",
             "--audio-format", "mp3",
             "--audio-quality", "0",
@@ -2092,6 +3140,56 @@ async def main():
             sys.argv = [a for a in sys.argv if a != flag]
     if VARIANT_HINT:
         print(f"Variant requested: {VARIANT_HINT}")
+
+    # Handle --backfill-tags — give every untagged song an ID3 title from its
+    # filename, so a later rename can't lose which song it is. Dry run unless
+    # --write is passed.
+    if "--backfill-tags" in sys.argv:
+        backfill_tags(dry_run="--write" not in sys.argv)
+        return
+
+    # Handle --sync-links — give every copy of a song the same source links, so
+    # Cmd+G answers the same on whichever copy Sam clicks. Dry run by default.
+    if "--sync-links" in sys.argv:
+        sync_links(dry_run="--write" not in sys.argv)
+        return
+
+    # Handle --rebuild-index — seed the reel -> song index from every Get Info
+    # comment in the library. Needed once; after that it maintains itself.
+    if "--rebuild-index" in sys.argv:
+        rebuild_reel_index()
+        return
+
+    # Handle --link <reel-url> <song title> — stamp a reel onto a song the
+    # library already holds. This closes the lettered-batch loop: when the real
+    # song was already owned it never got downloaded, so nothing stamped it.
+    # Sam names it once and every copy gets the link.
+    if "--link" in sys.argv:
+        i = sys.argv.index("--link")
+        rest = [a for a in sys.argv[i + 1:] if a != "--link"]
+        if len(rest) < 2:
+            print('Usage: song --link "<reel url>" "<song title>"')
+            sys.exit(1)
+        link_url, want_title = rest[0], " ".join(rest[1:])
+        matches = []
+        for inst in (False, True):
+            for p in find_existing_song(want_title, "", inst):
+                if p not in matches:
+                    matches.append(p)
+        if not matches:
+            print(f"No song called \"{want_title}\" in {OUTPUT_DIR}.")
+            sys.exit(1)
+        for p in matches:
+            added, total = append_finder_comment(p, link_url)
+            state = "added" if added else "already there"
+            try:
+                where = p.relative_to(OUTPUT_DIR)
+            except ValueError:
+                where = p
+            print(f"  {state} ({total} links) — {where}")
+        reindex_all()
+        print(f"\nLinked {len(matches)} copy(ies) of \"{want_title}\".")
+        return
 
     # Handle --reindex — just rebuild every folder's _Song Links.rtf and exit.
     # (reindex_all() self-heals moved local sources first.)
@@ -2185,6 +3283,32 @@ async def main():
     if local_file:
         url = str(local_file)  # record the clean absolute path as provenance
 
+    # Have we already taken the music off this exact reel? Doing it again costs
+    # Demucs, three fingerprint APIs and a YouTube search to reach an answer the
+    # library already holds. So ask before we spend that. Sam asked for the check
+    # on 2026-08-14 and for the question on 2026-08-16. `--force` skips the
+    # question. A non-interactive run has nobody to answer, so it stops instead.
+    if not local_file and "--force" not in sys.argv:
+        owner = reel_already_sourced(url)
+        if owner:
+            try:
+                where = owner.relative_to(OUTPUT_DIR)
+            except ValueError:
+                where = owner
+            print(f"Music already sourced from this reel: {where}")
+            if not sys.stdin.isatty():
+                print("Nothing to do. Use --force to run it again anyway.")
+                sys.exit(0)
+            try:
+                answer = input("Do this song again? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(0)
+            if answer not in ("y", "yes"):
+                print("Nothing to do.")
+                sys.exit(0)
+            print("Running it again...")
+
     # Validate URL
     if not local_file and "drive.google.com" in url.lower() and "/folders/" in url.lower():
         print("Error: That's a Google Drive folder link.")
@@ -2197,8 +3321,15 @@ async def main():
         check_dependencies()
         check_output_directory()
         print("YouTube URL detected — downloading audio directly...")
-        title_cmd = ["yt-dlp", "--get-title", "--no-playlist", "--quiet", url]
-        title_result = subprocess.run(title_cmd, capture_output=True, text=True)
+        # YouTube answers a cookie-less request with "Sign in to confirm you're
+        # not a bot", so this title probe signs in the same way
+        # download_youtube_mp3 does. Chrome cookies flake sometimes, so a bare
+        # call stays as the fallback.
+        for extra in (["--cookies-from-browser", "chrome"], []):
+            title_cmd = ["yt-dlp", *extra, "--get-title", "--no-playlist", "--quiet", url]
+            title_result = subprocess.run(title_cmd, capture_output=True, text=True)
+            if title_result.returncode == 0 and title_result.stdout.strip():
+                break
         if title_result.returncode != 0 or not title_result.stdout.strip():
             print(f"Could not fetch YouTube title: {title_result.stderr.strip()[:200]}")
             sys.exit(1)
@@ -2208,13 +3339,18 @@ async def main():
         filename = sanitize_filename(f"{yt_title}.mp3")
         output_path = OUTPUT_DIR / filename
         existing = already_downloaded(output_path)
-        if existing:
-            print(f"\nSong already exists: {existing}")
+        library_hit = find_existing_song(yt_title, "", _is_instrumental(yt_title))
+        if existing or library_hit:
+            owned = existing or library_hit[0]
+            print(f"\nSong already exists: {owned}")
+            added, total = append_finder_comment(owned, url)
+            if added:
+                print(f"Added this link to its Get Info ({total} links now).")
             sys.exit(0)
         if not download_youtube_mp3(url, output_path, url):
             print("YouTube download failed.")
             sys.exit(1)
-        output_path = finalize_song(output_path, url)
+        output_path = finalize_song(output_path, url, title=yt_title)
         print(f"\nSaved: {output_path}")
         print("Done!")
         sys.exit(0)
@@ -2263,6 +3399,10 @@ async def main():
             print("Failed to get audio from source.")
             sys.exit(1)
 
+        # The runners-up, best first. If the winner turns out to be unusable —
+        # see the retry loop below — the next guess gets a turn.
+        fallback_queue: list = []
+
         # If metadata gave us a song, skip the all-services identification and
         # fall through to the single-download flow below.
         if not song_info:
@@ -2270,8 +3410,10 @@ async def main():
             # Keeps every ACRCloud match >= 50, plus every unique AudD/Shazam match.
             print("\nRunning all services on raw audio...")
             seen_keys: set = set()
+            hit_counts: dict = {}
             candidates = await identify_song_candidates(
-                source_audio, start_offset=start_offset, seen_keys=seen_keys
+                source_audio, start_offset=start_offset, seen_keys=seen_keys,
+                hit_counts=hit_counts
             )
 
             # Always also run Demucs vocal isolation and re-run services on the
@@ -2286,6 +3428,7 @@ async def main():
                     start_offset=start_offset,
                     source_label="(stem)",
                     seen_keys=seen_keys,
+                    hit_counts=hit_counts,
                 )
                 candidates.extend(stem_candidates)
 
@@ -2311,13 +3454,37 @@ async def main():
                 score_str = f" (score {c.get('score')})" if c.get('score') is not None else ""
                 src_str = f" {c.get('source_label', '')}".rstrip() if c.get('source_label') else ""
                 seg_str = f" [{c.get('segment')}]" if c.get('segment') else ""
-                print(f"  - [{c.get('service')}]{src_str}{seg_str} {c['artist']} - {c['title']}{score_str}")
+                hits = hit_counts.get(_candidate_key(c), 0)
+                hit_str = f" — named {hits}x" if hits > 1 else ""
+                print(f"  - [{c.get('service')}]{src_str}{seg_str} {c['artist']} - {c['title']}{score_str}{hit_str}")
+
+            # One song named far more often than the rest is the answer, not a
+            # tie. Take it and use the single-song path, which adds the reel
+            # link to a song the library already holds.
+            winner = pick_confident_winner(candidates, hit_counts)
+            if winner:
+                win_hits = hit_counts.get(_candidate_key(winner), 0)
+                print(f"\nThe services agree on one song ({win_hits} of "
+                      f"{sum(hit_counts.values())} matches): "
+                      f"{winner['artist']} - {winner['title']}")
+                print("Treating that as the song. The others were one-off guesses.")
+                # Keep the losers as fallbacks. ACRCloud and AudD often answer
+                # with a RIGHTS-REGISTRATION entry — a writer's name plus an
+                # internal cue title, e.g. "CENDRICK RASHAD WHITNEY - Low
+                # Effortless" — which wins on hit count and then exists nowhere
+                # on YouTube. Shazam's name for the same recording was
+                # "Bon Iver - Wash.", which Sam already owned. So a winner that
+                # cannot be found is not the end of the search.
+                fallback_queue = sorted(
+                    (c for c in candidates if c is not winner),
+                    key=lambda c: hit_counts.get(_candidate_key(c), 0), reverse=True)
+                candidates = [winner]
 
             # Multi-candidate path: parent folder named after first match,
             # each candidate in its own subfolder with .mp3 + .txt sidecar.
             if len(candidates) > 1:
                 print(f"\nDownloading {len(candidates)} candidates as flat files into Music...")
-                saved, dest = download_candidates_flat(candidates, url)
+                saved, dest = download_candidates_flat(candidates, url, hit_counts)
                 if saved == 0:
                     print("\nAll candidate downloads failed.")
                     sys.exit(1)
@@ -2328,62 +3495,89 @@ async def main():
             # Single candidate — fall through to existing single-download path.
             song_info = candidates[0]
 
-        artist = song_info["artist"]
-        title = song_info["title"]
-        if song_info.get("source") != "tiktok_metadata":
-            print(f"\nIdentified: {artist} - {title}")
+        while True:
+            artist = song_info["artist"]
+            title = _strip_instrumental_tag(song_info["title"])
+            if song_info.get("source") != "tiktok_metadata":
+                print(f"\nIdentified: {artist} - {title}")
 
-        # Step 4: Download BOTH variants — instrumental backing track and the
-        # normal with-vocals version — into OUTPUT_DIR.
-        saved_any = False
-        used_ids: set = set()   # never let two variants land on the same video
-        for instrumental in DOWNLOAD_VARIANTS:
-            variant = "instrumental" if instrumental else "normal"
-            inst_suffix = " (instrumental)" if instrumental else ""
-            if song_info.get("offset") is not None:
-                timestamp = format_timestamp(song_info["offset"])
-                filename = sanitize_filename(f"{title}{inst_suffix} {timestamp}.mp3")
-            else:
-                filename = sanitize_filename(f"{title}{inst_suffix}.mp3")
-            output_path = OUTPUT_DIR / filename
+            # Step 4: Download BOTH variants — instrumental backing track and the
+            # normal with-vocals version — into OUTPUT_DIR.
+            saved_any = False
+            used_ids: set = set()   # never let two variants land on the same video
+            for instrumental in DOWNLOAD_VARIANTS:
+                variant = "instrumental" if instrumental else "normal"
+                inst_suffix = " (instrumental)" if instrumental else ""
+                if song_info.get("offset") is not None:
+                    timestamp = format_timestamp(song_info["offset"])
+                    filename = sanitize_filename(f"{title}{inst_suffix} {timestamp}.mp3")
+                else:
+                    filename = sanitize_filename(f"{title}{inst_suffix}.mp3")
+                output_path = OUTPUT_DIR / filename
+                tag_title = f"{title}{inst_suffix}"
 
-            existing = already_downloaded(output_path)
-            if existing:
-                print(f"\n{variant.capitalize()} version already exists: {existing.name}")
+                # Do we already own this exact version? The search covers the whole
+                # Music tree, so a song filed into a category folder — or renamed —
+                # still counts. A different edit (slowed, sped up, reverb) is a
+                # different version and does NOT count, so it downloads on its own.
+                existing = find_existing_song(title, artist, instrumental)
+                if existing:
+                    # EVERY copy of the song collects the reel link, the instrumental
+                    # cuts included. Sam asked for this on 2026-08-14: he presses
+                    # Cmd+G on whichever copy he happens to have open, so a link on
+                    # only one copy is a link he cannot find.
+                    for match in existing:
+                        added, total = append_finder_comment(match, url)
+                        print(f"\nAlready have: {match.name}")
+                        if added:
+                            print(f"  Added this link to its Get Info ({total} links now). "
+                                  f"Cmd+G on it opens them all.")
+                        else:
+                            print(f"  This link is already in its Get Info ({total} links).")
+                    saved_any = True
+                    continue
+
+                # Prefer TikTok direct audio (exact match) for the NORMAL version —
+                # the source clip carries the real vocals. The instrumental always
+                # comes from a YouTube "instrumental" search instead.
+                downloaded = False
+                if not instrumental and song_info.get("tiktok_audio_url"):
+                    print(f"\nDownloading {variant} version directly from TikTok...")
+                    downloaded = download_tiktok_direct_audio(song_info["tiktok_audio_url"], output_path, url)
+                    if downloaded:
+                        finalize_song(output_path, url, reindex=False,
+                                      title=tag_title, artist=artist)
+                        print(f"Saved: {output_path.name}")
+                    else:
+                        print("Direct TikTok download failed, trying YouTube...")
+
+                # Fall back to YouTube if no TikTok audio or download failed.
+                if not downloaded:
+                    youtube_url = search_youtube(artist, title, instrumental=instrumental,
+                                                 exclude_ids=used_ids)
+                    if not youtube_url:
+                        print(f"\nCould not find '{artist} - {title}' ({variant}) on YouTube.")
+                        continue
+                    used_ids.add(_yt_video_id(youtube_url))
+                    print(f"\nFound on YouTube ({variant}): {youtube_url}")
+                    if not download_youtube_mp3(youtube_url, output_path, url):
+                        print(f"Failed to download {variant} version from YouTube.")
+                        continue
+                    finalize_song(output_path, url, reindex=False,
+                                  title=tag_title, artist=artist)
+                    print(f"Saved: {output_path.name}")
+
                 saved_any = True
+
+            if saved_any:
+                break
+
+            if fallback_queue:
+                song_info = fallback_queue.pop(0)
+                print(f"\nNothing to download under that name. Trying the next "
+                      f"guess: {song_info['artist']} - {song_info['title']}")
                 continue
 
-            # Prefer TikTok direct audio (exact match) for the NORMAL version —
-            # the source clip carries the real vocals. The instrumental always
-            # comes from a YouTube "instrumental" search instead.
-            downloaded = False
-            if not instrumental and song_info.get("tiktok_audio_url"):
-                print(f"\nDownloading {variant} version directly from TikTok...")
-                downloaded = download_tiktok_direct_audio(song_info["tiktok_audio_url"], output_path, url)
-                if downloaded:
-                    finalize_song(output_path, url, reindex=False)
-                    print(f"Saved: {output_path.name}")
-                else:
-                    print("Direct TikTok download failed, trying YouTube...")
-
-            # Fall back to YouTube if no TikTok audio or download failed.
-            if not downloaded:
-                youtube_url = search_youtube(artist, title, instrumental=instrumental,
-                                             exclude_ids=used_ids)
-                if not youtube_url:
-                    print(f"\nCould not find '{artist} - {title}' ({variant}) on YouTube.")
-                    continue
-                used_ids.add(_yt_video_id(youtube_url))
-                print(f"\nFound on YouTube ({variant}): {youtube_url}")
-                if not download_youtube_mp3(youtube_url, output_path, url):
-                    print(f"Failed to download {variant} version from YouTube.")
-                    continue
-                finalize_song(output_path, url, reindex=False)
-                print(f"Saved: {output_path.name}")
-
-            saved_any = True
-
-        if not saved_any:
             print("\nCould not download either version. Try searching manually.")
             sys.exit(1)
 
